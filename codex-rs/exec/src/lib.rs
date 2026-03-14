@@ -1062,6 +1062,7 @@ fn session_configured_from_thread_fork_response(
         response.model_provider.clone(),
         response.service_tier,
         response.approval_policy.to_core(),
+        response.approvals_reviewer.to_core(),
         response.sandbox.to_core(),
         response.cwd.clone(),
         response.reasoning_effort,
