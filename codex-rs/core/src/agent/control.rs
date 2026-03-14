@@ -505,6 +505,7 @@ impl AgentControl {
 #[cfg(test)]
 #[path = "control_tests.rs"]
 mod tests;
+#[cfg(test)]
 mod fork_reference_tests {
     use super::*;
     use crate::CodexAuth;
@@ -898,6 +899,7 @@ mod fork_reference_tests {
             name: "spawn_agent".to_string(),
             arguments: "{}".to_string(),
             call_id: parent_spawn_call_id.clone(),
+            namespace: None,
         };
         parent_thread
             .codex
@@ -980,6 +982,7 @@ mod fork_reference_tests {
             name: "spawn_agent".to_string(),
             arguments: "{}".to_string(),
             call_id: parent_spawn_call_id.clone(),
+            namespace: None,
         };
         parent_thread
             .codex
@@ -1055,6 +1058,7 @@ mod fork_reference_tests {
             name: "spawn_agent".to_string(),
             arguments: "{}".to_string(),
             call_id: parent_spawn_call_id.clone(),
+            namespace: None,
         };
         parent_thread
             .codex
@@ -1134,6 +1138,7 @@ mod fork_reference_tests {
             name: "spawn_agent".to_string(),
             arguments: "{}".to_string(),
             call_id: parent_spawn_call_id.clone(),
+            namespace: None,
         };
         parent_thread
             .codex
