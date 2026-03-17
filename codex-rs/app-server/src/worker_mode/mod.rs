@@ -21,7 +21,8 @@ use codex_utils_cli::CliConfigOverrides;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::error;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -30,6 +31,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 mod handler;
 
 pub use handler::AppServerWorkerHandler;
+pub use handler::WorkerNotificationSender;
+pub use handler::WorkerSession;
 
 /// Initialize tracing to write to stderr only (REQ-2.4).
 ///
@@ -127,9 +130,12 @@ pub async fn run_worker_mode(
     let mut worker = StdioBusWorker::new();
     let handler = AppServerWorkerHandler::new(Arc::new(config), arg0_paths);
 
-    // Run worker loop (REQ-2.2, REQ-2.3, REQ-2.8)
+    // Take the notification receiver for the worker runtime (REQ-2.7)
+    let notification_rx = handler.take_notification_receiver().await;
+
+    // Run worker loop with notification support (REQ-2.2, REQ-2.3, REQ-2.7, REQ-2.8)
     worker
-        .run(handler)
+        .run_with_notifications(handler, notification_rx)
         .await
         .map_err(|e| std::io::Error::other(format!("worker error: {e}")))?;
 

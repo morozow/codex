@@ -1,26 +1,33 @@
-//! Worker mode message handler for app-server.
+//! Worker mode message handler for MCP server.
 //!
-//! This module provides the `AppServerWorkerHandler` which implements the
+//! This module provides the `McpServerWorkerHandler` which implements the
 //! `MessageHandler` trait from codex-stdio-bus. It handles incoming NDJSON
 //! messages and routes them to the appropriate session based on `sessionId`.
 //!
 //! # Requirements
-//! - REQ-2.5: Extract and use sessionId for thread affinity
-//! - REQ-2.6: Include sessionId in responses
-//! - REQ-2.7: Include sessionId in notifications
-//! - REQ-2.8: Graceful shutdown within drain_timeout_sec
+//! - REQ-3.2: Implement MCP protocol over stdin/stdout in worker mode
+//! - REQ-3.3: Bind session on `initialize` request with `sessionId`
+//! - REQ-3.4: Include `sessionId` in MCP responses
+//! - REQ-3.5: Perform graceful shutdown on SIGTERM
 
 use async_trait::async_trait;
-use codex_app_server_protocol::ClientRequest;
-use codex_app_server_protocol::JSONRPCErrorError;
-use codex_app_server_protocol::RequestId;
 use codex_arg0::Arg0DispatchPaths;
 use codex_core::config::Config;
 use codex_stdio_bus::message::Message;
 use codex_stdio_bus::session::extract_thread_id;
-use codex_stdio_bus::session::thread_to_session_id;
 use codex_stdio_bus::worker::MessageHandler;
 use codex_stdio_bus::worker::WorkerError;
+use rmcp::model::ClientNotification;
+use rmcp::model::ClientRequest;
+use rmcp::model::ErrorCode;
+use rmcp::model::ErrorData;
+use rmcp::model::Implementation;
+use rmcp::model::InitializeResult;
+use rmcp::model::JsonRpcMessage;
+use rmcp::model::RequestId;
+use rmcp::model::ServerCapabilities;
+use rmcp::model::ToolsCapability;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -31,181 +38,71 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
-use crate::error_code::INVALID_REQUEST_ERROR_CODE;
-use crate::message_processor::ConnectionSessionState;
+use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
+use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
 
-/// Default drain timeout in seconds for graceful shutdown (REQ-2.8, REQ-8.8).
+/// Default drain timeout in seconds for graceful shutdown (REQ-3.5).
 const DEFAULT_DRAIN_TIMEOUT_SEC: u64 = 30;
 
-/// Sender for outgoing notifications in worker mode (REQ-2.7).
+type IncomingMessage = JsonRpcMessage<ClientRequest, Value, ClientNotification>;
+
+/// Per-session state for MCP worker mode (REQ-3.3).
 ///
-/// This struct provides a way to send notifications with the correct `sessionId`
-/// for routing to the appropriate client through the stdio_bus daemon.
-#[derive(Clone)]
-pub struct WorkerNotificationSender {
-    /// The session ID to include in notifications.
-    session_id: String,
-    /// Channel to send notifications to the worker runtime.
-    notification_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-}
-
-impl WorkerNotificationSender {
-    /// Create a new notification sender for the given session.
-    pub fn new(
-        session_id: String,
-        notification_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    ) -> Self {
-        Self {
-            session_id,
-            notification_tx,
-        }
-    }
-
-    /// Create a notification sender from a thread ID (REQ-2.7).
-    ///
-    /// This uses `thread_to_session_id()` to map the thread ID to a session ID
-    /// in the format `thread:{threadId}`.
-    pub fn from_thread_id(
-        thread_id: &str,
-        notification_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    ) -> Self {
-        Self::new(thread_to_session_id(thread_id), notification_tx)
-    }
-
-    /// Get the session ID for this sender.
-    pub fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    /// Send a notification with the session ID included (REQ-2.7).
-    ///
-    /// The notification will be serialized to JSON with the `sessionId` field
-    /// added for proper routing through the stdio_bus daemon.
-    pub fn send_notification<T: serde::Serialize>(
-        &self,
-        method: &str,
-        params: T,
-    ) -> Result<(), WorkerError> {
-        let mut notification = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        });
-
-        // Inject sessionId for routing (REQ-2.7)
-        if let Some(obj) = notification.as_object_mut() {
-            obj.insert(
-                "sessionId".to_string(),
-                serde_json::Value::String(self.session_id.clone()),
-            );
-        }
-
-        let bytes = serde_json::to_vec(&notification)
-            .map_err(|e| WorkerError::Handler(format!("Failed to serialize notification: {e}")))?;
-
-        self.notification_tx
-            .send(bytes)
-            .map_err(|e| WorkerError::Handler(format!("Failed to send notification: {e}")))?;
-
-        debug!(
-            session_id = %self.session_id,
-            method,
-            "Sent notification with sessionId"
-        );
-
-        Ok(())
-    }
-
-    /// Send a raw notification value with the session ID included (REQ-2.7).
-    pub fn send_raw_notification(
-        &self,
-        mut notification: serde_json::Value,
-    ) -> Result<(), WorkerError> {
-        // Inject sessionId for routing (REQ-2.7)
-        if let Some(obj) = notification.as_object_mut() {
-            obj.insert(
-                "sessionId".to_string(),
-                serde_json::Value::String(self.session_id.clone()),
-            );
-        }
-
-        let bytes = serde_json::to_vec(&notification)
-            .map_err(|e| WorkerError::Handler(format!("Failed to serialize notification: {e}")))?;
-
-        self.notification_tx
-            .send(bytes)
-            .map_err(|e| WorkerError::Handler(format!("Failed to send notification: {e}")))?;
-
-        Ok(())
-    }
-}
-
-/// Per-session state for worker mode (REQ-2.5).
-///
-/// Each session maintains its own state, similar to how the existing app-server
-/// manages per-connection state. Sessions are identified by the `sessionId` field
+/// Each session maintains its own state, including initialization status
+/// and client capabilities. Sessions are identified by the `sessionId` field
 /// in incoming messages.
 #[derive(Debug)]
-pub struct WorkerSession {
+pub struct McpWorkerSession {
     /// The session identifier (from the `sessionId` field in messages).
     pub session_id: String,
     /// The thread ID extracted from the session ID (if applicable).
     pub thread_id: Option<String>,
-    /// Connection session state for message processing.
-    pub connection_state: ConnectionSessionState,
+    /// Whether the session has been initialized.
+    pub initialized: bool,
+    /// Client information from the initialize request.
+    pub client_info: Option<Implementation>,
 }
 
-impl WorkerSession {
+impl McpWorkerSession {
     /// Create a new session with the given session ID.
     pub fn new(session_id: String) -> Self {
         let thread_id = extract_thread_id(&session_id).map(String::from);
         Self {
             session_id,
             thread_id,
-            connection_state: ConnectionSessionState::default(),
-        }
-    }
-
-    /// Get the session ID to use for notifications (REQ-2.7).
-    ///
-    /// If the session has a thread ID, this returns the session ID in the
-    /// `thread:{threadId}` format. Otherwise, it returns the original session ID.
-    pub fn notification_session_id(&self) -> String {
-        if let Some(thread_id) = &self.thread_id {
-            thread_to_session_id(thread_id)
-        } else {
-            self.session_id.clone()
+            initialized: false,
+            client_info: None,
         }
     }
 }
 
-/// Worker mode handler for app-server (REQ-2).
+/// Worker mode handler for MCP server (REQ-3).
 ///
 /// This handler processes incoming NDJSON messages from the stdio_bus daemon
 /// and maintains session affinity based on the `sessionId` field.
-pub struct AppServerWorkerHandler {
+pub struct McpServerWorkerHandler {
     #[allow(dead_code)]
     config: Arc<Config>,
     #[allow(dead_code)]
     arg0_paths: Arg0DispatchPaths,
-    /// Session state keyed by session ID (REQ-2.5).
-    sessions: RwLock<HashMap<String, WorkerSession>>,
-    /// Channel for sending notifications (REQ-2.7).
+    /// Session state keyed by session ID (REQ-3.3).
+    sessions: RwLock<HashMap<String, McpWorkerSession>>,
+    /// Channel for sending notifications.
     /// Notifications sent through this channel will be written to stdout by the worker runtime.
     notification_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Receiver for notifications (held by the handler to be polled during run).
     notification_rx: RwLock<Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
-    /// Count of pending/in-flight requests (REQ-2.8).
+    /// Count of pending/in-flight requests (REQ-3.5).
     /// Used for graceful shutdown to wait for pending requests to complete.
     pending_requests: AtomicUsize,
-    /// Notifier for when pending requests complete (REQ-2.8).
+    /// Notifier for when pending requests complete (REQ-3.5).
     /// Used during graceful shutdown to signal when all requests are drained.
     drain_notify: tokio::sync::Notify,
-    /// Drain timeout in seconds for graceful shutdown (REQ-2.8).
+    /// Drain timeout in seconds for graceful shutdown (REQ-3.5).
     drain_timeout_sec: u64,
 }
 
-impl AppServerWorkerHandler {
+impl McpServerWorkerHandler {
     /// Create a new worker handler with the given configuration.
     pub fn new(config: Arc<Config>, arg0_paths: Arg0DispatchPaths) -> Self {
         let (notification_tx, notification_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -241,12 +138,12 @@ impl AppServerWorkerHandler {
         }
     }
 
-    /// Increment the pending request count (REQ-2.8).
+    /// Increment the pending request count (REQ-3.5).
     fn increment_pending(&self) {
         self.pending_requests.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Decrement the pending request count and notify if drained (REQ-2.8).
+    /// Decrement the pending request count and notify if drained (REQ-3.5).
     fn decrement_pending(&self) {
         let prev = self.pending_requests.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
@@ -267,19 +164,10 @@ impl AppServerWorkerHandler {
         &self.config
     }
 
-    /// Create a notification sender for the given session ID (REQ-2.7).
-    ///
-    /// The returned sender can be used to send notifications that will include
-    /// the session ID for proper routing through the stdio_bus daemon.
-    pub fn notification_sender(&self, session_id: &str) -> WorkerNotificationSender {
-        WorkerNotificationSender::new(session_id.to_string(), self.notification_tx.clone())
-    }
-
-    /// Create a notification sender for the given thread ID (REQ-2.7).
-    ///
-    /// This uses `thread_to_session_id()` to map the thread ID to a session ID.
-    pub fn notification_sender_for_thread(&self, thread_id: &str) -> WorkerNotificationSender {
-        WorkerNotificationSender::from_thread_id(thread_id, self.notification_tx.clone())
+    /// Get the notification sender for sending notifications with sessionId.
+    #[allow(dead_code)]
+    pub fn notification_tx(&self) -> &tokio::sync::mpsc::UnboundedSender<Vec<u8>> {
+        &self.notification_tx
     }
 
     /// Take the notification receiver for use in the worker runtime.
@@ -292,19 +180,20 @@ impl AppServerWorkerHandler {
         self.notification_rx.write().await.take()
     }
 
-    /// Get or create a session for the given session ID (REQ-2.5).
+    /// Get or create a session for the given session ID (REQ-3.3).
     ///
     /// This method ensures session affinity by returning the same session
     /// for the same session ID. If no session exists, a new one is created.
-    async fn get_or_create_session(&self, session_id: &str) -> WorkerSession {
+    async fn get_or_create_session(&self, session_id: &str) -> McpWorkerSession {
         // First, try to get an existing session with a read lock
         {
             let sessions = self.sessions.read().await;
             if let Some(session) = sessions.get(session_id) {
-                return WorkerSession {
+                return McpWorkerSession {
                     session_id: session.session_id.clone(),
                     thread_id: session.thread_id.clone(),
-                    connection_state: session.connection_state.clone(),
+                    initialized: session.initialized,
+                    client_info: session.client_info.clone(),
                 };
             }
         }
@@ -313,111 +202,99 @@ impl AppServerWorkerHandler {
         let mut sessions = self.sessions.write().await;
         // Double-check in case another task created it while we were waiting
         if let Some(session) = sessions.get(session_id) {
-            return WorkerSession {
+            return McpWorkerSession {
                 session_id: session.session_id.clone(),
                 thread_id: session.thread_id.clone(),
-                connection_state: session.connection_state.clone(),
+                initialized: session.initialized,
+                client_info: session.client_info.clone(),
             };
         }
 
-        let session = WorkerSession::new(session_id.to_string());
+        let session = McpWorkerSession::new(session_id.to_string());
         debug!(
             session_id,
             thread_id = ?session.thread_id,
-            "Created new worker session"
+            "Created new MCP worker session"
         );
         sessions.insert(
             session_id.to_string(),
-            WorkerSession::new(session_id.to_string()),
+            McpWorkerSession::new(session_id.to_string()),
         );
         session
     }
 
-    /// Update session state after processing a request.
-    async fn update_session_state(&self, session_id: &str, state: ConnectionSessionState) {
+    /// Update session state after processing an initialize request (REQ-3.3).
+    async fn mark_session_initialized(
+        &self,
+        session_id: &str,
+        client_info: Option<Implementation>,
+    ) {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            session.connection_state = state;
+            session.initialized = true;
+            session.client_info = client_info;
         }
     }
 
-    /// Process a JSON-RPC request and return a response.
+    /// Handle the initialize request (REQ-3.3).
     ///
-    /// This method handles the core request processing logic, delegating to
-    /// the appropriate handler based on the request type.
-    async fn process_request(
+    /// This binds the session to the MCP client connection and returns
+    /// the server capabilities.
+    fn handle_initialize(
         &self,
-        session: &mut WorkerSession,
-        request: ClientRequest,
-    ) -> Result<serde_json::Value, JSONRPCErrorError> {
-        let request_id = request.id().clone();
-
-        // Handle Initialize request specially
-        if let ClientRequest::Initialize {
-            request_id: _,
-            params,
-        } = &request
-        {
-            if session.connection_state.initialized {
-                return Err(JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: "Already initialized".to_string(),
-                    data: None,
-                });
-            }
-
-            // Process initialization
-            let (experimental_api_enabled, opt_out_notification_methods) =
-                match &params.capabilities {
-                    Some(capabilities) => (
-                        capabilities.experimental_api,
-                        capabilities
-                            .opt_out_notification_methods
-                            .clone()
-                            .unwrap_or_default(),
-                    ),
-                    None => (false, Vec::new()),
-                };
-
-            session.connection_state.experimental_api_enabled = experimental_api_enabled;
-            session.connection_state.opted_out_notification_methods =
-                opt_out_notification_methods.into_iter().collect();
-            session.connection_state.app_server_client_name = Some(params.client_info.name.clone());
-            session.connection_state.client_version = Some(params.client_info.version.clone());
-            session.connection_state.initialized = true;
-
-            let user_agent = codex_core::default_client::get_codex_user_agent();
-            let response = codex_app_server_protocol::InitializeResponse {
-                user_agent,
-                platform_family: std::env::consts::FAMILY.to_string(),
-                platform_os: std::env::consts::OS.to_string(),
-            };
-
-            return serde_json::to_value(response).map_err(|e| JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message: format!("Failed to serialize response: {e}"),
-                data: None,
-            });
+        session: &McpWorkerSession,
+        params: &rmcp::model::InitializeRequestParams,
+    ) -> Result<InitializeResult, ErrorData> {
+        if session.initialized {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_REQUEST,
+                "Session already initialized".to_string(),
+                None,
+            ));
         }
 
-        // For non-initialize requests, check if initialized
-        if !session.connection_state.initialized {
-            return Err(JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message: "Not initialized".to_string(),
-                data: None,
-            });
-        }
+        debug!(
+            session_id = %session.session_id,
+            client_name = %params.client_info.name,
+            client_version = %params.client_info.version,
+            "MCP session initialized"
+        );
 
-        // For now, return an error for unimplemented methods
-        // TODO: Integrate with full MessageProcessor for complete request handling
-        Err(JSONRPCErrorError {
-            code: -32601,
-            message: format!(
-                "Method not yet implemented in worker mode: request_id={request_id:?}"
-            ),
-            data: None,
+        Ok(InitializeResult {
+            protocol_version: params.protocol_version.clone(),
+            capabilities: ServerCapabilities {
+                tools: Some(ToolsCapability {
+                    list_changed: Some(true),
+                }),
+                ..Default::default()
+            },
+            server_info: Implementation {
+                name: "codex-mcp-server".to_string(),
+                title: Some("Codex".to_string()),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                description: None,
+                icons: None,
+                website_url: None,
+            },
+            instructions: None,
         })
+    }
+
+    /// Handle the ping request.
+    fn handle_ping(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    /// Handle the tools/list request.
+    fn handle_list_tools(&self) -> rmcp::model::ListToolsResult {
+        rmcp::model::ListToolsResult {
+            meta: None,
+            tools: vec![
+                create_tool_for_codex_tool_call_param(),
+                create_tool_for_codex_tool_call_reply_param(),
+            ],
+            next_cursor: None,
+        }
     }
 
     /// Build a JSON-RPC response with the given request ID and result.
@@ -430,7 +307,7 @@ impl AppServerWorkerHandler {
     }
 
     /// Build a JSON-RPC error response with the given request ID and error.
-    fn build_error_response(request_id: &RequestId, error: JSONRPCErrorError) -> serde_json::Value {
+    fn build_error_response(request_id: &RequestId, error: ErrorData) -> serde_json::Value {
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -444,7 +321,7 @@ impl AppServerWorkerHandler {
 }
 
 #[async_trait]
-impl MessageHandler for AppServerWorkerHandler {
+impl MessageHandler for McpServerWorkerHandler {
     async fn handle(&self, msg: Message) -> Result<Option<Vec<u8>>, WorkerError> {
         let session_id = msg.routing.session_id.as_deref();
         let method = msg.routing.method.as_deref();
@@ -455,7 +332,7 @@ impl MessageHandler for AppServerWorkerHandler {
             ?method,
             ?request_id,
             is_response = msg.routing.is_response,
-            "Received message"
+            "Received MCP message"
         );
 
         // If this is a response (not a request), we don't need to process it
@@ -464,78 +341,117 @@ impl MessageHandler for AppServerWorkerHandler {
             return Ok(None);
         }
 
-        // Parse the raw message as a JSON-RPC request
-        let request_value: serde_json::Value = serde_json::from_slice(&msg.raw)
-            .map_err(|e| WorkerError::Handler(format!("Failed to parse JSON: {e}")))?;
+        // Parse the raw message as a JSON-RPC message
+        let mcp_msg: IncomingMessage = serde_json::from_slice(&msg.raw)
+            .map_err(|e| WorkerError::Handler(format!("Failed to parse MCP message: {e}")))?;
 
-        // Extract the request ID from the parsed JSON (for error responses)
-        let json_request_id = request_value
-            .get("id")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        match mcp_msg {
+            JsonRpcMessage::Request(request) => {
+                let req_id = request.id.clone();
 
-        // If there's no request ID, this is a notification - no response needed
-        if json_request_id.is_null() {
-            debug!(?method, "Received notification (no response needed)");
-            return Ok(None);
-        }
+                // Track pending request for graceful shutdown (REQ-3.5)
+                self.increment_pending();
 
-        // Track pending request for graceful shutdown (REQ-2.8)
-        self.increment_pending();
+                // Get or create session for this request (REQ-3.3)
+                let session_id_str = session_id.unwrap_or("default");
+                let session = self.get_or_create_session(session_id_str).await;
 
-        // Try to parse as a ClientRequest
-        let client_request: ClientRequest = match serde_json::from_value(request_value.clone()) {
-            Ok(req) => req,
-            Err(e) => {
-                warn!(error = %e, "Failed to parse ClientRequest");
-                self.decrement_pending();
-                let error_response = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": json_request_id,
-                    "error": {
-                        "code": INVALID_REQUEST_ERROR_CODE,
-                        "message": format!("Invalid request: {e}")
+                let response = match &request.request {
+                    ClientRequest::InitializeRequest(params) => {
+                        match self.handle_initialize(&session, &params.params) {
+                            Ok(result) => {
+                                // Mark session as initialized
+                                self.mark_session_initialized(
+                                    session_id_str,
+                                    Some(params.params.client_info.clone()),
+                                )
+                                .await;
+
+                                let result_value = serde_json::to_value(result).map_err(|e| {
+                                    WorkerError::Handler(format!(
+                                        "Failed to serialize initialize result: {e}"
+                                    ))
+                                })?;
+                                Self::build_response(&req_id, result_value)
+                            }
+                            Err(error) => Self::build_error_response(&req_id, error),
+                        }
                     }
-                });
-                return Ok(Some(serde_json::to_vec(&error_response).map_err(|e| {
-                    WorkerError::Handler(format!("Failed to serialize error response: {e}"))
-                })?));
+                    ClientRequest::PingRequest(_) => {
+                        let result = self.handle_ping();
+                        Self::build_response(&req_id, result)
+                    }
+                    ClientRequest::ListToolsRequest(_) => {
+                        let result = self.handle_list_tools();
+                        let result_value = serde_json::to_value(result).map_err(|e| {
+                            WorkerError::Handler(format!(
+                                "Failed to serialize list tools result: {e}"
+                            ))
+                        })?;
+                        Self::build_response(&req_id, result_value)
+                    }
+                    // For other requests, check if session is initialized
+                    _ => {
+                        if !session.initialized {
+                            Self::build_error_response(
+                                &req_id,
+                                ErrorData::new(
+                                    ErrorCode::INVALID_REQUEST,
+                                    "Session not initialized".to_string(),
+                                    None,
+                                ),
+                            )
+                        } else {
+                            // Return method not found for unimplemented methods
+                            // TODO: Integrate with full MessageProcessor for complete request handling
+                            Self::build_error_response(
+                                &req_id,
+                                ErrorData::new(
+                                    ErrorCode::METHOD_NOT_FOUND,
+                                    format!(
+                                        "Method not yet implemented in worker mode: {:?}",
+                                        method
+                                    ),
+                                    None,
+                                ),
+                            )
+                        }
+                    }
+                };
+
+                // Serialize and return the response (REQ-3.4: sessionId is injected by worker runtime)
+                let response_bytes = serde_json::to_vec(&response).map_err(|e| {
+                    WorkerError::Handler(format!("Failed to serialize response: {e}"))
+                })?;
+
+                // Request complete, decrement pending count (REQ-3.5)
+                self.decrement_pending();
+
+                Ok(Some(response_bytes))
             }
-        };
-
-        let request_id = client_request.id().clone();
-
-        // Get or create session for this request (REQ-2.5)
-        let session_id_str = session_id.unwrap_or("default");
-        let mut session = self.get_or_create_session(session_id_str).await;
-
-        // Process the request
-        let response = match self.process_request(&mut session, client_request).await {
-            Ok(result) => Self::build_response(&request_id, result),
-            Err(error) => Self::build_error_response(&request_id, error),
-        };
-
-        // Update session state
-        self.update_session_state(session_id_str, session.connection_state)
-            .await;
-
-        // Serialize and return the response (REQ-2.6: sessionId is injected by worker runtime)
-        let response_bytes = serde_json::to_vec(&response)
-            .map_err(|e| WorkerError::Handler(format!("Failed to serialize response: {e}")))?;
-
-        // Request complete, decrement pending count (REQ-2.8)
-        self.decrement_pending();
-
-        Ok(Some(response_bytes))
+            JsonRpcMessage::Notification(notification) => {
+                // Handle notifications - no response needed
+                debug!(
+                    method = ?notification.notification,
+                    "Received MCP notification (no response needed)"
+                );
+                Ok(None)
+            }
+            JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => {
+                // Responses/errors from client are unusual but we ignore them
+                warn!("Received unexpected response/error from MCP client");
+                Ok(None)
+            }
+        }
     }
 
-    /// Graceful shutdown handler (REQ-2.8, REQ-8.8).
+    /// Graceful shutdown handler (REQ-3.5).
     ///
     /// This method is called when SIGTERM is received. It:
     /// 1. Waits for pending requests to drain within `drain_timeout_sec`
     /// 2. Cleans up all active sessions
     async fn on_shutdown(&self) {
-        info!("App-server worker initiating graceful shutdown (REQ-2.8)");
+        info!("MCP server worker initiating graceful shutdown (REQ-3.5)");
 
         let pending = self.pending_requests.load(Ordering::SeqCst);
         let drain_timeout = Duration::from_secs(self.drain_timeout_sec);
@@ -544,7 +460,7 @@ impl MessageHandler for AppServerWorkerHandler {
             info!(
                 pending_requests = pending,
                 drain_timeout_sec = self.drain_timeout_sec,
-                "Draining pending requests before shutdown"
+                "Draining pending MCP requests before shutdown"
             );
 
             // Wait for pending requests to complete or timeout
@@ -562,7 +478,7 @@ impl MessageHandler for AppServerWorkerHandler {
 
             match drain_result {
                 Ok(()) => {
-                    info!("All pending requests drained successfully");
+                    info!("All pending MCP requests drained successfully");
                 }
                 Err(_) => {
                     let remaining = self.pending_requests.load(Ordering::SeqCst);
@@ -574,7 +490,7 @@ impl MessageHandler for AppServerWorkerHandler {
                 }
             }
         } else {
-            info!("No pending requests to drain");
+            info!("No pending MCP requests to drain");
         }
 
         // Clean up all sessions
@@ -584,11 +500,11 @@ impl MessageHandler for AppServerWorkerHandler {
             debug!(
                 session_id,
                 thread_id = ?session.thread_id,
-                initialized = session.connection_state.initialized,
-                "Cleaning up session"
+                initialized = session.initialized,
+                "Cleaning up MCP session"
             );
         }
-        info!(session_count, "Cleaned up all worker sessions");
+        info!(session_count, "Cleaned up all MCP worker sessions");
     }
 }
 
@@ -598,10 +514,10 @@ mod tests {
     use codex_stdio_bus::message::RoutingFields;
     use pretty_assertions::assert_eq;
 
-    fn create_test_handler() -> AppServerWorkerHandler {
+    fn create_test_handler() -> McpServerWorkerHandler {
         let config = Config::load_default_with_cli_overrides(vec![]).unwrap();
         let arg0_paths = Arg0DispatchPaths::default();
-        AppServerWorkerHandler::new(Arc::new(config), arg0_paths)
+        McpServerWorkerHandler::new(Arc::new(config), arg0_paths)
     }
 
     #[tokio::test]
@@ -612,7 +528,7 @@ mod tests {
 
         assert_eq!(session.session_id, "thread:test-123");
         assert_eq!(session.thread_id, Some("test-123".to_string()));
-        assert!(!session.connection_state.initialized);
+        assert!(!session.initialized);
     }
 
     #[tokio::test]
@@ -623,17 +539,15 @@ mod tests {
         let session1 = handler.get_or_create_session("thread:test-456").await;
         assert_eq!(session1.session_id, "thread:test-456");
 
-        // Update session state
-        let mut updated_state = session1.connection_state.clone();
-        updated_state.initialized = true;
+        // Mark session as initialized
         handler
-            .update_session_state("thread:test-456", updated_state)
+            .mark_session_initialized("thread:test-456", None)
             .await;
 
         // Get session again - should return the same session with updated state
         let session2 = handler.get_or_create_session("thread:test-456").await;
         assert_eq!(session2.session_id, "thread:test-456");
-        assert!(session2.connection_state.initialized);
+        assert!(session2.initialized);
     }
 
     #[tokio::test]
@@ -655,6 +569,8 @@ mod tests {
             "id": 1,
             "method": "initialize",
             "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
                 "clientInfo": {
                     "name": "test-client",
                     "version": "1.0.0"
@@ -682,20 +598,147 @@ mod tests {
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 1);
         assert!(response["result"].is_object());
-        assert!(response["result"]["userAgent"].is_string());
-        assert!(response["result"]["platformFamily"].is_string());
-        assert!(response["result"]["platformOs"].is_string());
+        assert!(response["result"]["serverInfo"].is_object());
+        assert_eq!(response["result"]["serverInfo"]["name"], "codex-mcp-server");
+        assert!(response["result"]["capabilities"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_handle_ping_request() {
+        let handler = create_test_handler();
+
+        // First initialize the session
+        let init_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0.0"
+                }
+            }
+        });
+
+        let init_msg = Message {
+            raw: serde_json::to_vec(&init_request).unwrap(),
+            routing: RoutingFields {
+                id: Some(codex_stdio_bus::message::RequestId::Integer(1)),
+                session_id: Some("thread:test-ping".to_string()),
+                method: Some("initialize".to_string()),
+                is_response: false,
+                is_error: false,
+            },
+        };
+        handler.handle(init_msg).await.unwrap();
+
+        // Now send ping
+        let ping_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping"
+        });
+
+        let ping_msg = Message {
+            raw: serde_json::to_vec(&ping_request).unwrap(),
+            routing: RoutingFields {
+                id: Some(codex_stdio_bus::message::RequestId::Integer(2)),
+                session_id: Some("thread:test-ping".to_string()),
+                method: Some("ping".to_string()),
+                is_response: false,
+                is_error: false,
+            },
+        };
+
+        let result = handler.handle(ping_msg).await;
+        assert!(result.is_ok());
+
+        let response_bytes = result.unwrap().expect("Should have response");
+        let response: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["result"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_handle_list_tools_request() {
+        let handler = create_test_handler();
+
+        // First initialize the session
+        let init_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0.0"
+                }
+            }
+        });
+
+        let init_msg = Message {
+            raw: serde_json::to_vec(&init_request).unwrap(),
+            routing: RoutingFields {
+                id: Some(codex_stdio_bus::message::RequestId::Integer(1)),
+                session_id: Some("thread:test-tools".to_string()),
+                method: Some("initialize".to_string()),
+                is_response: false,
+                is_error: false,
+            },
+        };
+        handler.handle(init_msg).await.unwrap();
+
+        // Now send tools/list
+        let list_tools_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+
+        let list_tools_msg = Message {
+            raw: serde_json::to_vec(&list_tools_request).unwrap(),
+            routing: RoutingFields {
+                id: Some(codex_stdio_bus::message::RequestId::Integer(2)),
+                session_id: Some("thread:test-tools".to_string()),
+                method: Some("tools/list".to_string()),
+                is_response: false,
+                is_error: false,
+            },
+        };
+
+        let result = handler.handle(list_tools_msg).await;
+        assert!(result.is_ok());
+
+        let response_bytes = result.unwrap().expect("Should have response");
+        let response: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 2);
+        assert!(response["result"]["tools"].is_array());
+        // Should have at least the codex and codex-reply tools
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert!(tools.len() >= 2);
     }
 
     #[tokio::test]
     async fn test_handle_request_before_initialize() {
         let handler = create_test_handler();
 
+        // Send a request without initializing first
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "thread/start",
-            "params": {}
+            "method": "tools/call",
+            "params": {
+                "name": "codex",
+                "arguments": {}
+            }
         });
 
         let msg = Message {
@@ -703,7 +746,7 @@ mod tests {
             routing: RoutingFields {
                 id: Some(codex_stdio_bus::message::RequestId::Integer(1)),
                 session_id: Some("thread:test-uninit".to_string()),
-                method: Some("thread/start".to_string()),
+                method: Some("tools/call".to_string()),
                 is_response: false,
                 is_error: false,
             },
@@ -718,7 +761,7 @@ mod tests {
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 1);
         assert!(response["error"].is_object());
-        assert_eq!(response["error"]["message"], "Not initialized");
+        assert_eq!(response["error"]["message"], "Session not initialized");
     }
 
     #[tokio::test]
@@ -730,6 +773,8 @@ mod tests {
             "id": 1,
             "method": "initialize",
             "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
                 "clientInfo": {
                     "name": "test-client",
                     "version": "1.0.0"
@@ -761,6 +806,8 @@ mod tests {
             "id": 2,
             "method": "initialize",
             "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
                 "clientInfo": {
                     "name": "test-client",
                     "version": "1.0.0"
@@ -784,7 +831,7 @@ mod tests {
         let response2: serde_json::Value =
             serde_json::from_slice(&result2.unwrap().unwrap()).unwrap();
         assert!(response2["error"].is_object());
-        assert_eq!(response2["error"]["message"], "Already initialized");
+        assert_eq!(response2["error"]["message"], "Session already initialized");
     }
 
     #[tokio::test]
@@ -794,8 +841,7 @@ mod tests {
         // Notification has no id
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
-            "method": "some/notification",
-            "params": {}
+            "method": "notifications/initialized"
         });
 
         let msg = Message {
@@ -803,7 +849,7 @@ mod tests {
             routing: RoutingFields {
                 id: None,
                 session_id: Some("thread:test-notif".to_string()),
-                method: Some("some/notification".to_string()),
+                method: Some("notifications/initialized".to_string()),
                 is_response: false,
                 is_error: false,
             },
@@ -847,26 +893,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_invalid_json() {
-        let handler = create_test_handler();
-
-        let msg = Message {
-            raw: b"not valid json".to_vec(),
-            routing: RoutingFields {
-                id: Some(codex_stdio_bus::message::RequestId::Integer(1)),
-                session_id: Some("thread:test-invalid".to_string()),
-                method: Some("test/method".to_string()),
-                is_response: false,
-                is_error: false,
-            },
-        };
-
-        let result = handler.handle(msg).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), WorkerError::Handler(_)));
-    }
-
-    #[tokio::test]
     async fn test_session_affinity_across_requests() {
         let handler = create_test_handler();
         let session_id = "thread:affinity-test";
@@ -877,6 +903,8 @@ mod tests {
             "id": 1,
             "method": "initialize",
             "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
                 "clientInfo": {
                     "name": "affinity-test-client",
                     "version": "2.0.0"
@@ -899,115 +927,14 @@ mod tests {
 
         // Verify session state was preserved
         let session = handler.get_or_create_session(session_id).await;
-        assert!(session.connection_state.initialized);
+        assert!(session.initialized);
         assert_eq!(
-            session.connection_state.app_server_client_name,
-            Some("affinity-test-client".to_string())
-        );
-        assert_eq!(
-            session.connection_state.client_version,
-            Some("2.0.0".to_string())
+            session.client_info.as_ref().map(|c| c.name.as_str()),
+            Some("affinity-test-client")
         );
     }
 
-    // Tests for session ID extraction and propagation (REQ-2.5, REQ-2.6, REQ-2.7)
-
-    #[tokio::test]
-    async fn test_thread_to_session_id_mapping() {
-        // Test that thread_to_session_id correctly maps thread IDs to session IDs
-        let session_id = thread_to_session_id("my-thread-123");
-        assert_eq!(session_id, "thread:my-thread-123");
-    }
-
-    #[tokio::test]
-    async fn test_session_notification_session_id() {
-        // Test that WorkerSession correctly returns the notification session ID
-        let session = WorkerSession::new("thread:test-thread".to_string());
-        assert_eq!(session.notification_session_id(), "thread:test-thread");
-        assert_eq!(session.thread_id, Some("test-thread".to_string()));
-
-        // Test with a non-thread session ID
-        let session2 = WorkerSession::new("custom-session".to_string());
-        assert_eq!(session2.notification_session_id(), "custom-session");
-        assert_eq!(session2.thread_id, None);
-    }
-
-    #[tokio::test]
-    async fn test_notification_sender_includes_session_id() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let sender = WorkerNotificationSender::new("thread:test-123".to_string(), tx);
-
-        // Send a notification
-        sender
-            .send_notification("test/notification", serde_json::json!({"key": "value"}))
-            .unwrap();
-
-        // Verify the notification includes sessionId
-        let notification_bytes = rx.recv().await.unwrap();
-        let notification: serde_json::Value = serde_json::from_slice(&notification_bytes).unwrap();
-
-        assert_eq!(notification["jsonrpc"], "2.0");
-        assert_eq!(notification["method"], "test/notification");
-        assert_eq!(notification["sessionId"], "thread:test-123");
-        assert_eq!(notification["params"]["key"], "value");
-    }
-
-    #[tokio::test]
-    async fn test_notification_sender_from_thread_id() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let sender = WorkerNotificationSender::from_thread_id("my-thread", tx);
-
-        assert_eq!(sender.session_id(), "thread:my-thread");
-
-        // Send a notification
-        sender
-            .send_notification("thread/update", serde_json::json!({"status": "running"}))
-            .unwrap();
-
-        // Verify the notification includes the correct sessionId
-        let notification_bytes = rx.recv().await.unwrap();
-        let notification: serde_json::Value = serde_json::from_slice(&notification_bytes).unwrap();
-
-        assert_eq!(notification["sessionId"], "thread:my-thread");
-        assert_eq!(notification["method"], "thread/update");
-    }
-
-    #[tokio::test]
-    async fn test_handler_notification_sender() {
-        let handler = create_test_handler();
-
-        // Create a notification sender for a session
-        let sender = handler.notification_sender("thread:test-session");
-        assert_eq!(sender.session_id(), "thread:test-session");
-
-        // Create a notification sender for a thread
-        let thread_sender = handler.notification_sender_for_thread("my-thread");
-        assert_eq!(thread_sender.session_id(), "thread:my-thread");
-    }
-
-    #[tokio::test]
-    async fn test_raw_notification_includes_session_id() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let sender = WorkerNotificationSender::new("thread:raw-test".to_string(), tx);
-
-        // Send a raw notification
-        let raw_notification = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "custom/event",
-            "params": {"data": 123}
-        });
-        sender.send_raw_notification(raw_notification).unwrap();
-
-        // Verify sessionId was injected
-        let notification_bytes = rx.recv().await.unwrap();
-        let notification: serde_json::Value = serde_json::from_slice(&notification_bytes).unwrap();
-
-        assert_eq!(notification["sessionId"], "thread:raw-test");
-        assert_eq!(notification["method"], "custom/event");
-        assert_eq!(notification["params"]["data"], 123);
-    }
-
-    // Tests for graceful shutdown (REQ-2.8, REQ-8.8)
+    // Tests for graceful shutdown (REQ-3.5)
 
     #[tokio::test]
     async fn test_pending_request_tracking() {
@@ -1052,7 +979,7 @@ mod tests {
         let config = Config::load_default_with_cli_overrides(vec![]).unwrap();
         let arg0_paths = Arg0DispatchPaths::default();
         // Use a short drain timeout for testing
-        let handler = Arc::new(AppServerWorkerHandler::with_drain_timeout(
+        let handler = Arc::new(McpServerWorkerHandler::with_drain_timeout(
             Arc::new(config),
             arg0_paths,
             2, // 2 second timeout
@@ -1087,7 +1014,7 @@ mod tests {
         let config = Config::load_default_with_cli_overrides(vec![]).unwrap();
         let arg0_paths = Arg0DispatchPaths::default();
         // Use a very short drain timeout for testing
-        let handler = Arc::new(AppServerWorkerHandler::with_drain_timeout(
+        let handler = Arc::new(McpServerWorkerHandler::with_drain_timeout(
             Arc::new(config),
             arg0_paths,
             1, // 1 second timeout
@@ -1123,6 +1050,8 @@ mod tests {
             "id": 1,
             "method": "initialize",
             "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
                 "clientInfo": {
                     "name": "test-client",
                     "version": "1.0.0"
@@ -1146,40 +1075,6 @@ mod tests {
         assert!(result.is_ok());
 
         // After handling, pending count should be back to 0
-        assert_eq!(handler.pending_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_handle_decrements_pending_on_parse_error() {
-        let handler = create_test_handler();
-
-        // Initially no pending requests
-        assert_eq!(handler.pending_count(), 0);
-
-        // Send an invalid request (valid JSON but invalid ClientRequest)
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "unknown/method",
-            "params": {}
-        });
-
-        let msg = Message {
-            raw: serde_json::to_vec(&request).unwrap(),
-            routing: RoutingFields {
-                id: Some(codex_stdio_bus::message::RequestId::Integer(1)),
-                session_id: Some("thread:test-error".to_string()),
-                method: Some("unknown/method".to_string()),
-                is_response: false,
-                is_error: false,
-            },
-        };
-
-        // Handle the request (will fail to parse as ClientRequest)
-        let result = handler.handle(msg).await;
-        assert!(result.is_ok());
-
-        // After handling (even with error), pending count should be back to 0
         assert_eq!(handler.pending_count(), 0);
     }
 }

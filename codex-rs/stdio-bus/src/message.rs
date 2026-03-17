@@ -1,6 +1,7 @@
 //! Message types and parsing for stdio_bus protocol.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 
 /// Raw message with extracted routing information.

@@ -2179,14 +2179,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-mcp-proxy"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "codex-stdio-bus",
+ "pretty_assertions",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "codex-mcp-server"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "clap",
  "codex-arg0",
  "codex-core",
  "codex-protocol",
  "codex-shell-command",
+ "codex-stdio-bus",
  "codex-utils-cli",
  "codex-utils-json-to-toml",
  "core_test_support",

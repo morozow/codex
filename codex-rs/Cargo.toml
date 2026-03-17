@@ -33,6 +33,7 @@ members = [
     "lmstudio",
     "login",
     "mcp-server",
+    "mcp-proxy",
     "network-proxy",
     "ollama",
     "process-hardening",
@@ -114,6 +115,7 @@ codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
+codex-mcp-proxy = { path = "mcp-proxy" }
 codex-mcp-server = { path = "mcp-server" }
 codex-network-proxy = { path = "network-proxy" }
 codex-ollama = { path = "ollama" }

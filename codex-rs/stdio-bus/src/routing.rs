@@ -1,8 +1,11 @@
 //! Routing field extraction from JSON-RPC messages.
 
-use crate::message::{Message, RequestId, RoutingFields};
+use crate::message::Message;
+use crate::message::RequestId;
+use crate::message::RoutingFields;
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::debug;
+use tracing::warn;
 
 /// Maximum session ID length in bytes.
 pub const MAX_SESSION_ID_LEN: usize = 256;

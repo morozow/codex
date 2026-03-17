@@ -29,6 +29,10 @@ mod exec_approval;
 pub(crate) mod message_processor;
 mod outgoing_message;
 mod patch_approval;
+mod worker_mode;
+
+pub use worker_mode::McpServerWorkerHandler;
+pub use worker_mode::McpWorkerSession;
 
 use crate::message_processor::MessageProcessor;
 use crate::outgoing_message::OutgoingJsonRpcMessage;
@@ -171,6 +175,64 @@ pub async fn run_main(
     // the processor and then to the stdout task.
     let _ = tokio::join!(stdin_reader_handle, processor_handle, stdout_writer_handle);
 
+    Ok(())
+}
+
+/// Run the MCP server in stdio_bus worker mode.
+///
+/// In worker mode, the MCP server reads NDJSON messages from stdin and writes
+/// responses to stdout. Session affinity is maintained via the `sessionId` field
+/// in messages. Diagnostic output is written to stderr only.
+///
+/// This mode is designed for use with the stdio_bus daemon, which manages
+/// multiple worker instances and routes messages based on session ID.
+///
+/// # Requirements
+/// - REQ-3.1: Support `--worker` CLI flag to enable worker mode
+/// - REQ-3.2: Implement MCP protocol over stdin/stdout in worker mode
+/// - REQ-3.3: Bind session on `initialize` request with `sessionId`
+/// - REQ-3.4: Include `sessionId` in MCP responses
+/// - REQ-3.5: Perform graceful shutdown on SIGTERM
+pub async fn run_worker_mode(
+    arg0_paths: Arg0DispatchPaths,
+    cli_config_overrides: CliConfigOverrides,
+) -> IoResult<()> {
+    // Parse CLI overrides and load configuration
+    let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("error parsing -c overrides: {e}"),
+        )
+    })?;
+    let config = Config::load_with_cli_overrides(cli_kv_overrides)
+        .await
+        .map_err(|e| {
+            std::io::Error::new(ErrorKind::InvalidData, format!("error loading config: {e}"))
+        })?;
+
+    // Initialize tracing to stderr only (REQ-3.2: stdout is for NDJSON only)
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(EnvFilter::from_default_env());
+
+    let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
+
+    info!("Starting MCP server in worker mode");
+
+    // Create worker and handler
+    let mut worker = codex_stdio_bus::worker::StdioBusWorker::new();
+    let handler = McpServerWorkerHandler::new(std::sync::Arc::new(config), arg0_paths);
+
+    // Take the notification receiver for the worker runtime
+    let notification_rx = handler.take_notification_receiver().await;
+
+    // Run worker loop with notification support (REQ-3.2, REQ-3.3, REQ-3.4, REQ-3.5)
+    worker
+        .run_with_notifications(handler, notification_rx)
+        .await
+        .map_err(|e| std::io::Error::new(ErrorKind::Other, e.to_string()))?;
+
+    info!("MCP server worker mode stopped");
     Ok(())
 }
 

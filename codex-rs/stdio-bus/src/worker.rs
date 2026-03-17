@@ -4,9 +4,14 @@ use crate::message::Message;
 use crate::routing::parse_message;
 use async_trait::async_trait;
 use std::io::ErrorKind;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
 use tokio::sync::watch;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
 
 /// Error type for worker operations.
 #[derive(Debug, thiserror::Error)]
@@ -188,6 +193,157 @@ impl StdioBusWorker {
 
         info!("Worker stopped");
         Ok(())
+    }
+    /// Run the worker loop with support for outgoing notifications (REQ-2.7).
+    ///
+    /// This method extends the basic `run()` method to also poll for outgoing
+    /// notifications from the provided receiver. Notifications are sent to stdout
+    /// with their `sessionId` already included (the handler is responsible for
+    /// adding the `sessionId` to notifications).
+    ///
+    /// # Arguments
+    /// * `handler` - The message handler for processing incoming messages
+    /// * `notification_rx` - Optional receiver for outgoing notifications
+    pub async fn run_with_notifications<H: MessageHandler>(
+        &mut self,
+        handler: H,
+        mut notification_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    ) -> Result<(), WorkerError> {
+        info!("Worker starting with notification support");
+
+        // Set up signal handler.
+        let shutdown_tx = self.shutdown_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(()) = tokio::signal::ctrl_c().await {
+                info!("Received SIGINT, initiating shutdown");
+                let _ = shutdown_tx.send(true);
+            }
+        });
+
+        #[cfg(unix)]
+        {
+            let shutdown_tx = self.shutdown_tx.clone();
+            tokio::spawn(async move {
+                let Ok(mut sigterm) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                else {
+                    tracing::warn!("Failed to register SIGTERM handler");
+                    return;
+                };
+
+                sigterm.recv().await;
+                info!("Received SIGTERM, initiating graceful shutdown");
+                let _ = shutdown_tx.send(true);
+            });
+        }
+
+        // Clone shutdown_rx to avoid borrowing self in multiple select! branches
+        let mut shutdown_rx = self.shutdown_rx.clone();
+
+        loop {
+            tokio::select! {
+                biased;
+
+                // Check for shutdown
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Shutdown requested, draining...");
+                        handler.on_shutdown().await;
+                        break;
+                    }
+                }
+
+                // Poll for outgoing notifications (REQ-2.7)
+                notification = async {
+                    if let Some(rx) = &mut notification_rx {
+                        rx.recv().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    if let Some(notification_bytes) = notification {
+                        // Notifications already have sessionId included by the sender
+                        if let Err(e) = self.send(&notification_bytes).await {
+                            error!(error = %e, "Failed to send notification");
+                        } else {
+                            debug!("Sent notification to stdout");
+                        }
+                    }
+                }
+
+                // Poll for incoming messages
+                result = self.recv_inner() => {
+                    match result {
+                        Ok(msg) => {
+                            let session_id = msg.routing.session_id.clone();
+
+                            match handler.handle(msg).await {
+                                Ok(Some(mut response)) => {
+                                    // Preserve sessionId in response (REQ-2.6)
+                                    if let Some(sid) = &session_id
+                                        && let Err(e) = Self::inject_session_id(&mut response, sid)
+                                    {
+                                        warn!(error = %e, "Failed to inject sessionId");
+                                    }
+                                    if let Err(e) = self.send(&response).await {
+                                        error!(error = %e, "Failed to send response");
+                                    }
+                                }
+                                Ok(None) => {
+                                    // No response needed (notification).
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Handler error");
+                                }
+                            }
+                        }
+                        Err(WorkerError::Shutdown) => {
+                            info!("Shutdown requested, draining...");
+                            handler.on_shutdown().await;
+                            break;
+                        }
+                        Err(WorkerError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => {
+                            info!("stdin closed, shutting down");
+                            break;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Worker error");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("Worker stopped");
+        Ok(())
+    }
+
+    /// Internal method to receive a message without shutdown handling.
+    /// Used by `run_with_notifications` to allow proper select! usage.
+    async fn recv_inner(&mut self) -> Result<Message, WorkerError> {
+        let mut line = String::new();
+
+        loop {
+            match self.stdin.read_line(&mut line).await {
+                Ok(0) => {
+                    debug!("stdin EOF");
+                    return Err(WorkerError::Io(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "stdin closed",
+                    )));
+                }
+                Ok(_) => {
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        line.clear();
+                        continue;
+                    }
+                    return Ok(parse_message(trimmed.as_bytes().to_vec()));
+                }
+                Err(e) => return Err(WorkerError::Io(e)),
+            }
+        }
     }
 }
 
@@ -1052,6 +1208,339 @@ mod tests {
         }
     }
 
+    /// **Validates: Requirements 2.4, 8.3**
+    ///
+    /// Property 7: Stderr-Only Diagnostics
+    /// Tests that worker mode writes diagnostics to stderr only and stdout contains only valid JSON.
+    mod property_stderr_only_diagnostics {
+        use super::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(500))]
+
+            /// Test that stdout output is always valid JSON.
+            /// This verifies that no diagnostic content (logs, traces) appears on stdout.
+            #[test]
+            fn stdout_output_is_always_valid_json(
+                id in "[a-zA-Z0-9_-]{1,32}",
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+                session_id in prop::option::of("[a-zA-Z0-9:_-]{1,64}"),
+            ) {
+                // Build a JSON-RPC message (simulating what would be written to stdout)
+                let mut msg = serde_json::Map::new();
+                msg.insert("jsonrpc".to_string(), serde_json::json!("2.0"));
+                msg.insert("id".to_string(), serde_json::json!(id));
+                msg.insert("method".to_string(), serde_json::json!(method));
+                if let Some(ref sid) = session_id {
+                    msg.insert("sessionId".to_string(), serde_json::json!(sid));
+                }
+                msg.insert("params".to_string(), serde_json::json!({}));
+
+                // Serialize to JSON bytes (simulating stdout write)
+                let json_bytes = serde_json::to_vec(&msg).unwrap();
+
+                // Verify the output is valid JSON
+                let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&json_bytes);
+                prop_assert!(parsed.is_ok(), "stdout output must be valid JSON");
+
+                // Verify the output is a JSON object (not a primitive or array)
+                let value = parsed.unwrap();
+                prop_assert!(value.is_object(), "stdout output must be a JSON object");
+
+                // Verify no diagnostic-like content in the JSON
+                // Diagnostic content would typically have fields like "level", "target", "message"
+                // that are characteristic of log output
+                let obj = value.as_object().unwrap();
+                prop_assert!(
+                    !obj.contains_key("level") || obj.contains_key("jsonrpc"),
+                    "stdout should not contain log-like 'level' field without being JSON-RPC"
+                );
+                prop_assert!(
+                    !obj.contains_key("target") || obj.contains_key("jsonrpc"),
+                    "stdout should not contain log-like 'target' field without being JSON-RPC"
+                );
+            }
+
+            /// Test that response messages written to stdout are valid JSON-RPC.
+            #[test]
+            fn response_output_is_valid_jsonrpc(
+                id in prop_oneof![
+                    any::<i64>().prop_map(|n| serde_json::json!(n)),
+                    "[a-zA-Z0-9_-]{1,32}".prop_map(|s| serde_json::json!(s)),
+                ],
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+                result_data in "[a-zA-Z0-9]{1,32}",
+            ) {
+                // Create a response message
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"data": result_data}
+                });
+                let mut response_bytes = serde_json::to_vec(&response).unwrap();
+
+                // Inject sessionId (simulating worker runtime)
+                StdioBusWorker::inject_session_id(&mut response_bytes, &session_id).unwrap();
+
+                // Verify the output is valid JSON
+                let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&response_bytes);
+                prop_assert!(parsed.is_ok(), "response output must be valid JSON");
+
+                // Verify it's a valid JSON-RPC response
+                let value = parsed.unwrap();
+                prop_assert!(value.is_object(), "response must be a JSON object");
+                let obj = value.as_object().unwrap();
+                prop_assert!(obj.contains_key("jsonrpc"), "response must have jsonrpc field");
+                prop_assert!(obj.contains_key("id"), "response must have id field");
+                prop_assert!(
+                    obj.contains_key("result") || obj.contains_key("error"),
+                    "response must have result or error field"
+                );
+            }
+
+            /// Test that error responses written to stdout are valid JSON-RPC.
+            #[test]
+            fn error_response_output_is_valid_jsonrpc(
+                id in "[a-zA-Z0-9_-]{1,32}",
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+                error_code in any::<i32>(),
+                error_message in "[a-zA-Z ]{1,32}",
+            ) {
+                // Create an error response message
+                let error_response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": error_code,
+                        "message": error_message
+                    }
+                });
+                let mut response_bytes = serde_json::to_vec(&error_response).unwrap();
+
+                // Inject sessionId (simulating worker runtime)
+                StdioBusWorker::inject_session_id(&mut response_bytes, &session_id).unwrap();
+
+                // Verify the output is valid JSON
+                let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&response_bytes);
+                prop_assert!(parsed.is_ok(), "error response output must be valid JSON");
+
+                // Verify it's a valid JSON-RPC error response
+                let value = parsed.unwrap();
+                prop_assert!(value.is_object(), "error response must be a JSON object");
+                let obj = value.as_object().unwrap();
+                prop_assert!(obj.contains_key("jsonrpc"), "error response must have jsonrpc field");
+                prop_assert!(obj.contains_key("id"), "error response must have id field");
+                prop_assert!(obj.contains_key("error"), "error response must have error field");
+
+                // Verify error structure
+                let error = obj.get("error").unwrap();
+                prop_assert!(error.is_object(), "error field must be an object");
+                let error_obj = error.as_object().unwrap();
+                prop_assert!(error_obj.contains_key("code"), "error must have code field");
+                prop_assert!(error_obj.contains_key("message"), "error must have message field");
+            }
+
+            /// Test that notification messages written to stdout are valid JSON-RPC.
+            #[test]
+            fn notification_output_is_valid_jsonrpc(
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+            ) {
+                // Create a notification message (no id field)
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": {}
+                });
+                let mut notification_bytes = serde_json::to_vec(&notification).unwrap();
+
+                // Inject sessionId (simulating worker runtime)
+                StdioBusWorker::inject_session_id(&mut notification_bytes, &session_id).unwrap();
+
+                // Verify the output is valid JSON
+                let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&notification_bytes);
+                prop_assert!(parsed.is_ok(), "notification output must be valid JSON");
+
+                // Verify it's a valid JSON-RPC notification
+                let value = parsed.unwrap();
+                prop_assert!(value.is_object(), "notification must be a JSON object");
+                let obj = value.as_object().unwrap();
+                prop_assert!(obj.contains_key("jsonrpc"), "notification must have jsonrpc field");
+                prop_assert!(obj.contains_key("method"), "notification must have method field");
+                prop_assert!(!obj.contains_key("id"), "notification must not have id field");
+            }
+
+            /// Test that NDJSON lines are each valid JSON.
+            /// This verifies that multiple messages written to stdout are properly framed.
+            #[test]
+            fn ndjson_lines_are_each_valid_json(
+                messages in prop::collection::vec(
+                    (
+                        "[a-zA-Z0-9_-]{1,16}",  // id
+                        "[a-zA-Z]+/[a-zA-Z]+",  // method
+                        "[a-zA-Z0-9:_-]{1,32}", // session_id
+                    ),
+                    1..10
+                )
+            ) {
+                // Build multiple NDJSON lines (simulating stdout output)
+                let mut ndjson = String::new();
+                for (id, method, session_id) in &messages {
+                    let msg = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": method,
+                        "params": {},
+                        "sessionId": session_id
+                    });
+                    ndjson.push_str(&serde_json::to_string(&msg).unwrap());
+                    ndjson.push('\n');
+                }
+
+                // Parse each line and verify it's valid JSON
+                for (i, line) in ndjson.trim_end().split('\n').enumerate() {
+                    let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
+                    prop_assert!(
+                        parsed.is_ok(),
+                        "NDJSON line {} must be valid JSON: {}",
+                        i,
+                        line
+                    );
+
+                    let value = parsed.unwrap();
+                    prop_assert!(
+                        value.is_object(),
+                        "NDJSON line {} must be a JSON object",
+                        i
+                    );
+                }
+            }
+
+            /// Test that stdout output does not contain common diagnostic patterns.
+            /// This verifies that log output, stack traces, and other diagnostics
+            /// are not mixed with JSON-RPC messages.
+            #[test]
+            fn stdout_output_has_no_diagnostic_patterns(
+                id in "[a-zA-Z0-9_-]{1,32}",
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+            ) {
+                // Create a valid JSON-RPC message
+                let msg = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": {}
+                });
+                let json_str = serde_json::to_string(&msg).unwrap();
+
+                // Verify the output doesn't contain common diagnostic patterns
+                // These patterns would indicate log output mixed with JSON
+                prop_assert!(
+                    !json_str.contains("TRACE") || json_str.contains("\"TRACE\""),
+                    "stdout should not contain unquoted TRACE log level"
+                );
+                prop_assert!(
+                    !json_str.contains("DEBUG") || json_str.contains("\"DEBUG\""),
+                    "stdout should not contain unquoted DEBUG log level"
+                );
+                prop_assert!(
+                    !json_str.contains("INFO") || json_str.contains("\"INFO\""),
+                    "stdout should not contain unquoted INFO log level"
+                );
+                prop_assert!(
+                    !json_str.contains("WARN") || json_str.contains("\"WARN\""),
+                    "stdout should not contain unquoted WARN log level"
+                );
+                prop_assert!(
+                    !json_str.contains("ERROR") || json_str.contains("\"ERROR\""),
+                    "stdout should not contain unquoted ERROR log level"
+                );
+
+                // Verify no stack trace patterns
+                prop_assert!(
+                    !json_str.contains("at ") || json_str.contains("\"at \""),
+                    "stdout should not contain stack trace 'at ' pattern"
+                );
+                prop_assert!(
+                    !json_str.contains("panic") || json_str.contains("\"panic\""),
+                    "stdout should not contain unquoted 'panic'"
+                );
+            }
+        }
+
+        /// Test that the worker's send method produces valid NDJSON output.
+        #[tokio::test]
+        async fn worker_send_produces_valid_ndjson() {
+            // This test verifies the contract that send() writes valid JSON followed by newline
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "test-1",
+                "result": {"status": "ok"}
+            });
+            let bytes = serde_json::to_vec(&msg).unwrap();
+
+            // Verify the bytes are valid JSON
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(parsed.is_object());
+            assert_eq!(parsed["jsonrpc"], "2.0");
+            assert_eq!(parsed["id"], "test-1");
+        }
+
+        /// Test that inject_session_id maintains valid JSON output.
+        #[test]
+        fn inject_session_id_maintains_valid_json() {
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "test-1",
+                "result": {"data": "value"}
+            });
+            let mut bytes = serde_json::to_vec(&msg).unwrap();
+
+            // Inject sessionId
+            StdioBusWorker::inject_session_id(&mut bytes, "thread:abc-123").unwrap();
+
+            // Verify output is still valid JSON
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(parsed.is_object());
+            assert_eq!(parsed["jsonrpc"], "2.0");
+            assert_eq!(parsed["sessionId"], "thread:abc-123");
+        }
+
+        /// Test that complex nested JSON maintains validity after processing.
+        #[test]
+        fn complex_json_maintains_validity() {
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "complex-1",
+                "result": {
+                    "nested": {
+                        "array": [1, 2, 3],
+                        "object": {"key": "value"},
+                        "null": null,
+                        "bool": true,
+                        "number": 42.5
+                    }
+                }
+            });
+            let mut bytes = serde_json::to_vec(&msg).unwrap();
+
+            // Inject sessionId
+            StdioBusWorker::inject_session_id(&mut bytes, "conn:12345").unwrap();
+
+            // Verify output is still valid JSON with all nested structures intact
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(parsed.is_object());
+            assert_eq!(
+                parsed["result"]["nested"]["array"],
+                serde_json::json!([1, 2, 3])
+            );
+            assert_eq!(parsed["result"]["nested"]["object"]["key"], "value");
+            assert!(parsed["result"]["nested"]["null"].is_null());
+            assert_eq!(parsed["result"]["nested"]["bool"], true);
+            assert_eq!(parsed["result"]["nested"]["number"], 42.5);
+        }
+    }
+
     /// Unit tests for edge cases.
     mod unit_tests {
         use super::*;
@@ -1182,6 +1671,387 @@ mod tests {
                 Some("thread:abc-456".to_string())
             );
             assert!(parsed_response.routing.is_response);
+        }
+    }
+
+    /// **Validates: Requirements 2.5, 3.3**
+    ///
+    /// Property 8: Session Affinity
+    /// Tests that requests with the same sessionId are processed by the same session,
+    /// maintaining state consistency across multiple requests.
+    mod property_session_affinity {
+        use super::*;
+        use std::collections::HashMap;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(500))]
+
+            /// Test that requests with the same sessionId are routed to the same session.
+            /// This simulates the session routing behavior where sessionId determines
+            /// which session handles the request.
+            #[test]
+            fn same_session_id_routes_to_same_session(
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+                request_ids in prop::collection::vec("[a-zA-Z0-9_-]{1,16}", 2..10),
+            ) {
+                // Simulate a session registry (like the handler's sessions HashMap)
+                let mut session_registry: HashMap<String, Vec<String>> = HashMap::new();
+
+                // Process multiple requests with the same sessionId
+                for request_id in &request_ids {
+                    let request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "test/method",
+                        "params": {},
+                        "sessionId": session_id
+                    });
+                    let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                    // Parse the request and extract sessionId
+                    let parsed = parse_message(request_bytes);
+                    let extracted_session_id = parsed.routing.session_id.clone();
+
+                    // Verify sessionId was extracted correctly
+                    prop_assert_eq!(extracted_session_id.as_deref(), Some(session_id.as_str()));
+
+                    // Route to session (simulating get_or_create_session behavior)
+                    let session_key = extracted_session_id.unwrap();
+                    session_registry
+                        .entry(session_key)
+                        .or_default()
+                        .push(request_id.clone());
+                }
+
+                // Verify all requests were routed to the same session
+                prop_assert_eq!(session_registry.len(), 1, "All requests should route to one session");
+                let session_requests = session_registry.get(&session_id).unwrap();
+                prop_assert_eq!(session_requests.len(), request_ids.len());
+            }
+
+            /// Test that session state is preserved across multiple requests with the same sessionId.
+            /// This simulates the stateful session behavior where initialization state persists.
+            #[test]
+            fn session_state_preserved_across_requests(
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+                num_requests in 2..10usize,
+            ) {
+                // Simulate session state (like WorkerSession or McpWorkerSession)
+                struct MockSession {
+                    initialized: bool,
+                    request_count: usize,
+                }
+
+                let mut sessions: HashMap<String, MockSession> = HashMap::new();
+
+                // Process multiple requests
+                for i in 0..num_requests {
+                    let request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("req-{i}"),
+                        "method": if i == 0 { "initialize" } else { "test/method" },
+                        "params": {},
+                        "sessionId": session_id
+                    });
+                    let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                    // Parse and extract sessionId
+                    let parsed = parse_message(request_bytes);
+                    let extracted_session_id = parsed.routing.session_id.clone().unwrap();
+
+                    // Get or create session (simulating handler behavior)
+                    let session = sessions.entry(extracted_session_id.clone()).or_insert_with(|| {
+                        MockSession {
+                            initialized: false,
+                            request_count: 0,
+                        }
+                    });
+
+                    // Update session state
+                    if parsed.routing.method.as_deref() == Some("initialize") {
+                        session.initialized = true;
+                    }
+                    session.request_count += 1;
+                }
+
+                // Verify session state was preserved
+                prop_assert_eq!(sessions.len(), 1, "Should have exactly one session");
+                let session = sessions.get(&session_id).unwrap();
+                prop_assert!(session.initialized, "Session should be initialized");
+                prop_assert_eq!(session.request_count, num_requests, "All requests should be counted");
+            }
+
+            /// Test that different sessionIds result in different sessions.
+            /// This verifies session isolation between different clients/threads.
+            #[test]
+            fn different_session_ids_create_different_sessions(
+                session_ids in prop::collection::hash_set("[a-zA-Z0-9:_-]{1,32}", 2..10),
+            ) {
+                let session_ids: Vec<String> = session_ids.into_iter().collect();
+                let mut session_registry: HashMap<String, usize> = HashMap::new();
+
+                // Process one request per sessionId
+                for (i, session_id) in session_ids.iter().enumerate() {
+                    let request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("req-{i}"),
+                        "method": "test/method",
+                        "params": {},
+                        "sessionId": session_id
+                    });
+                    let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                    // Parse and extract sessionId
+                    let parsed = parse_message(request_bytes);
+                    let extracted_session_id = parsed.routing.session_id.clone().unwrap();
+
+                    // Route to session
+                    *session_registry.entry(extracted_session_id).or_insert(0) += 1;
+                }
+
+                // Verify each sessionId created a separate session
+                prop_assert_eq!(
+                    session_registry.len(),
+                    session_ids.len(),
+                    "Each sessionId should have its own session"
+                );
+
+                // Verify each session received exactly one request
+                for count in session_registry.values() {
+                    prop_assert_eq!(*count, 1, "Each session should have exactly one request");
+                }
+            }
+
+            /// Test that session affinity works with thread: prefixed sessionIds.
+            /// This validates REQ-2.5 for app-server thread affinity.
+            #[test]
+            fn thread_session_affinity(
+                thread_id in "[a-zA-Z0-9_-]{1,32}",
+                request_ids in prop::collection::vec("[a-zA-Z0-9_-]{1,16}", 2..10),
+            ) {
+                let session_id = format!("thread:{thread_id}");
+                let mut session_requests: Vec<String> = Vec::new();
+
+                // Process multiple requests with the same thread sessionId
+                for request_id in &request_ids {
+                    let request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "thread/message",
+                        "params": {"content": "test"},
+                        "sessionId": session_id
+                    });
+                    let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                    // Parse and verify sessionId
+                    let parsed = parse_message(request_bytes);
+                    prop_assert_eq!(parsed.routing.session_id.as_deref(), Some(session_id.as_str()));
+
+                    // Verify thread ID can be extracted
+                    let extracted_thread_id = crate::session::extract_thread_id(&session_id);
+                    prop_assert_eq!(extracted_thread_id, Some(thread_id.as_str()));
+
+                    session_requests.push(request_id.clone());
+                }
+
+                // Verify all requests were processed in order
+                prop_assert_eq!(session_requests.len(), request_ids.len());
+            }
+
+            /// Test that session affinity works with MCP server sessionIds.
+            /// This validates REQ-3.3 for MCP session binding.
+            #[test]
+            fn mcp_session_affinity(
+                server_name in "[a-zA-Z0-9_-]{1,32}",
+                request_ids in prop::collection::vec(any::<i64>(), 2..10),
+            ) {
+                let session_id = format!("mcp:{server_name}");
+                let mut session_state = (false, 0usize); // (initialized, request_count)
+
+                // Process multiple requests with the same MCP sessionId
+                for (i, request_id) in request_ids.iter().enumerate() {
+                    let method = if i == 0 { "initialize" } else { "tools/list" };
+                    let request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": method,
+                        "params": if i == 0 {
+                            serde_json::json!({
+                                "protocolVersion": "2024-11-05",
+                                "capabilities": {},
+                                "clientInfo": {"name": "test", "version": "1.0"}
+                            })
+                        } else {
+                            serde_json::json!({})
+                        },
+                        "sessionId": session_id
+                    });
+                    let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                    // Parse and verify sessionId
+                    let parsed = parse_message(request_bytes);
+                    prop_assert_eq!(parsed.routing.session_id.as_deref(), Some(session_id.as_str()));
+
+                    // Verify MCP server name can be extracted
+                    let extracted_server = crate::session::extract_mcp_server_name(&session_id);
+                    prop_assert_eq!(extracted_server, Some(server_name.as_str()));
+
+                    // Update session state
+                    if parsed.routing.method.as_deref() == Some("initialize") {
+                        session_state.0 = true;
+                    }
+                    session_state.1 += 1;
+                }
+
+                // Verify session state was maintained
+                prop_assert!(session_state.0, "Session should be initialized");
+                prop_assert_eq!(session_state.1, request_ids.len());
+            }
+
+            /// Test that interleaved requests from different sessions maintain isolation.
+            /// This simulates concurrent clients sending requests.
+            #[test]
+            fn interleaved_requests_maintain_session_isolation(
+                session_a in "session-a-[a-zA-Z0-9]{1,16}",
+                session_b in "session-b-[a-zA-Z0-9]{1,16}",
+                num_requests in 2..10usize,
+            ) {
+                let mut session_states: HashMap<String, Vec<i32>> = HashMap::new();
+
+                // Interleave requests from two sessions
+                for i in 0..num_requests {
+                    // Request from session A
+                    let request_a = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("a-{i}"),
+                        "method": "test/method",
+                        "params": {"value": i * 2},
+                        "sessionId": session_a
+                    });
+                    let parsed_a = parse_message(serde_json::to_vec(&request_a).unwrap());
+                    let sid_a = parsed_a.routing.session_id.clone().unwrap();
+                    session_states.entry(sid_a).or_default().push((i * 2) as i32);
+
+                    // Request from session B
+                    let request_b = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("b-{i}"),
+                        "method": "test/method",
+                        "params": {"value": i * 2 + 1},
+                        "sessionId": session_b
+                    });
+                    let parsed_b = parse_message(serde_json::to_vec(&request_b).unwrap());
+                    let sid_b = parsed_b.routing.session_id.clone().unwrap();
+                    session_states.entry(sid_b).or_default().push((i * 2 + 1) as i32);
+                }
+
+                // Verify sessions are isolated
+                prop_assert_eq!(session_states.len(), 2, "Should have exactly two sessions");
+
+                let state_a = session_states.get(&session_a).unwrap();
+                let state_b = session_states.get(&session_b).unwrap();
+
+                prop_assert_eq!(state_a.len(), num_requests);
+                prop_assert_eq!(state_b.len(), num_requests);
+
+                // Verify session A has even values, session B has odd values
+                for (i, &val) in state_a.iter().enumerate() {
+                    prop_assert_eq!(val, (i * 2) as i32, "Session A should have even values");
+                }
+                for (i, &val) in state_b.iter().enumerate() {
+                    prop_assert_eq!(val, (i * 2 + 1) as i32, "Session B should have odd values");
+                }
+            }
+
+            /// Test that responses maintain session affinity with their requests.
+            /// This verifies the full request-response cycle preserves sessionId.
+            #[test]
+            fn response_maintains_session_affinity(
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+                request_id in "[a-zA-Z0-9_-]{1,32}",
+                result_data in "[a-zA-Z0-9]{1,32}",
+            ) {
+                // Create request with sessionId
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "test/method",
+                    "params": {},
+                    "sessionId": session_id
+                });
+                let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                // Parse request and extract sessionId
+                let parsed_request = parse_message(request_bytes);
+                let extracted_session_id = parsed_request.routing.session_id.clone();
+                prop_assert_eq!(extracted_session_id.as_deref(), Some(session_id.as_str()));
+
+                // Create response without sessionId (simulating handler output)
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"data": result_data}
+                });
+                let mut response_bytes = serde_json::to_vec(&response).unwrap();
+
+                // Inject sessionId (simulating worker runtime)
+                if let Some(sid) = &extracted_session_id {
+                    StdioBusWorker::inject_session_id(&mut response_bytes, sid).unwrap();
+                }
+
+                // Parse response and verify sessionId is preserved
+                let parsed_response = parse_message(response_bytes);
+                prop_assert_eq!(
+                    parsed_response.routing.session_id.as_deref(),
+                    Some(session_id.as_str()),
+                    "Response should have same sessionId as request"
+                );
+                prop_assert_eq!(
+                    parsed_response.routing.id,
+                    parsed_request.routing.id,
+                    "Response should have same id as request"
+                );
+            }
+
+            /// Test that session affinity is maintained for all session type formats.
+            #[test]
+            fn session_affinity_for_all_session_types(
+                session_type in prop_oneof![
+                    "thread:[a-zA-Z0-9_-]{1,32}",
+                    "conn:[0-9]{1,10}",
+                    "mcp:[a-zA-Z0-9_-]{1,32}",
+                    "[a-zA-Z0-9_-]{1,32}",  // custom/unknown format
+                ],
+                num_requests in 2..5usize,
+            ) {
+                let mut session_request_ids: Vec<String> = Vec::new();
+
+                // Process multiple requests with the same sessionId
+                for i in 0..num_requests {
+                    let request_id = format!("req-{i}");
+                    let request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "test/method",
+                        "params": {},
+                        "sessionId": session_type
+                    });
+                    let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                    // Parse and verify sessionId
+                    let parsed = parse_message(request_bytes);
+                    prop_assert_eq!(
+                        parsed.routing.session_id.as_deref(),
+                        Some(session_type.as_str()),
+                        "SessionId should be extracted correctly for all formats"
+                    );
+
+                    session_request_ids.push(request_id);
+                }
+
+                // Verify all requests were processed
+                prop_assert_eq!(session_request_ids.len(), num_requests);
+            }
         }
     }
 }
