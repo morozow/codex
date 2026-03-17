@@ -551,6 +551,507 @@ mod tests {
         }
     }
 
+    /// **Validates: Requirements 2.6, 5.4, 8.6**
+    ///
+    /// Property 3: SessionId Preservation in Responses
+    /// Tests that responses contain the same sessionId as requests.
+    mod property_session_id_preservation {
+        use super::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            /// Test that when a request contains a sessionId, the response includes the same sessionId.
+            /// This simulates the worker runtime behavior where sessionId is extracted from the request
+            /// and injected into the response.
+            #[test]
+            fn response_contains_same_session_id_as_request(
+                request_id in prop_oneof![
+                    any::<i64>().prop_map(|n| serde_json::json!(n)),
+                    "[a-zA-Z0-9_-]{1,32}".prop_map(|s| serde_json::json!(s)),
+                ],
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+                result_data in "[a-zA-Z0-9]{1,32}",
+            ) {
+                // Step 1: Create a request with sessionId
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": {},
+                    "sessionId": session_id
+                });
+                let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                // Step 2: Parse the request and extract sessionId (simulating worker recv)
+                let parsed_request = parse_message(request_bytes);
+                let extracted_session_id = parsed_request.routing.session_id.clone();
+
+                // Verify sessionId was extracted correctly
+                prop_assert_eq!(extracted_session_id.as_deref(), Some(session_id.as_str()));
+
+                // Step 3: Create a response without sessionId (simulating handler response)
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"data": result_data}
+                });
+                let mut response_bytes = serde_json::to_vec(&response).unwrap();
+
+                // Step 4: Inject sessionId into response (simulating worker runtime)
+                if let Some(sid) = &extracted_session_id {
+                    StdioBusWorker::inject_session_id(&mut response_bytes, sid).unwrap();
+                }
+
+                // Step 5: Verify the response contains the same sessionId as the request
+                let final_response: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+                assert_eq!(final_response["sessionId"], serde_json::json!(session_id));
+                assert_eq!(final_response["id"], request_id);
+            }
+
+            /// Test that sessionId is preserved through the full request-response cycle
+            /// for various session ID formats (thread:, conn:, mcp:).
+            #[test]
+            fn session_id_preserved_for_all_formats(
+                request_id in "[a-zA-Z0-9_-]{1,32}",
+                session_type in prop_oneof![
+                    "thread:[a-zA-Z0-9_-]{1,32}",
+                    "conn:[0-9]{1,10}",
+                    "mcp:[a-zA-Z0-9_-]{1,32}",
+                ],
+            ) {
+                // Create request with typed sessionId
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "test/method",
+                    "sessionId": session_type
+                });
+                let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                // Parse and extract sessionId
+                let parsed_request = parse_message(request_bytes);
+                let extracted_session_id = parsed_request.routing.session_id.clone();
+                prop_assert_eq!(extracted_session_id.as_deref(), Some(session_type.as_str()));
+
+                // Create response and inject sessionId
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {}
+                });
+                let mut response_bytes = serde_json::to_vec(&response).unwrap();
+
+                if let Some(sid) = &extracted_session_id {
+                    StdioBusWorker::inject_session_id(&mut response_bytes, sid).unwrap();
+                }
+
+                // Verify sessionId is preserved
+                let final_response: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+                assert_eq!(final_response["sessionId"], serde_json::json!(session_type));
+            }
+
+            /// Test that different sessionIds are correctly preserved for different requests.
+            /// This verifies that each request-response pair maintains its own sessionId.
+            #[test]
+            fn different_session_ids_preserved_for_different_requests(
+                requests in prop::collection::vec(
+                    (
+                        "[a-zA-Z0-9_-]{1,16}",  // request_id
+                        "[a-zA-Z0-9:_-]{1,32}", // session_id
+                    ),
+                    2..10
+                )
+            ) {
+                // Process each request independently and verify sessionId preservation
+                for (request_id, session_id) in &requests {
+                    // Create request
+                    let request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "test/method",
+                        "sessionId": session_id
+                    });
+                    let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                    // Parse and extract sessionId
+                    let parsed_request = parse_message(request_bytes);
+                    let extracted_session_id = parsed_request.routing.session_id.clone();
+                    prop_assert_eq!(extracted_session_id.as_deref(), Some(session_id.as_str()));
+
+                    // Create response and inject sessionId
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {"processed": true}
+                    });
+                    let mut response_bytes = serde_json::to_vec(&response).unwrap();
+
+                    if let Some(sid) = &extracted_session_id {
+                        StdioBusWorker::inject_session_id(&mut response_bytes, sid).unwrap();
+                    }
+
+                    // Verify this specific sessionId is preserved
+                    let final_response: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+                    assert_eq!(final_response["sessionId"], serde_json::json!(session_id));
+                    assert_eq!(final_response["id"], serde_json::json!(request_id));
+                }
+            }
+
+            /// Test that sessionId preservation works with error responses.
+            #[test]
+            fn session_id_preserved_in_error_responses(
+                request_id in "[a-zA-Z0-9_-]{1,32}",
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+                error_code in any::<i32>(),
+                error_message in "[a-zA-Z ]{1,32}",
+            ) {
+                // Create request with sessionId
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "test/method",
+                    "sessionId": session_id
+                });
+                let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                // Parse and extract sessionId
+                let parsed_request = parse_message(request_bytes);
+                let extracted_session_id = parsed_request.routing.session_id.clone();
+
+                // Create error response without sessionId
+                let error_response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": error_code,
+                        "message": error_message
+                    }
+                });
+                let mut response_bytes = serde_json::to_vec(&error_response).unwrap();
+
+                // Inject sessionId
+                if let Some(sid) = &extracted_session_id {
+                    StdioBusWorker::inject_session_id(&mut response_bytes, sid).unwrap();
+                }
+
+                // Verify sessionId is preserved in error response
+                let final_response: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+                assert_eq!(final_response["sessionId"], serde_json::json!(session_id));
+                prop_assert!(final_response["error"].is_object());
+                assert_eq!(final_response["error"]["code"], serde_json::json!(error_code));
+            }
+
+            /// Test that requests without sessionId result in responses without sessionId.
+            /// This verifies the worker runtime only injects sessionId when present in request.
+            #[test]
+            fn no_session_id_when_request_has_none(
+                request_id in "[a-zA-Z0-9_-]{1,32}",
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+            ) {
+                // Create request without sessionId
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": {}
+                });
+                let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                // Parse and verify no sessionId
+                let parsed_request = parse_message(request_bytes);
+                prop_assert!(parsed_request.routing.session_id.is_none());
+
+                // Create response
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {}
+                });
+                let response_bytes = serde_json::to_vec(&response).unwrap();
+
+                // Don't inject sessionId (simulating worker runtime behavior when no sessionId in request)
+                // Verify response has no sessionId
+                let final_response: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+                prop_assert!(final_response.get("sessionId").is_none());
+            }
+
+            /// Test that sessionId with special characters is preserved correctly.
+            #[test]
+            fn session_id_with_special_chars_preserved(
+                request_id in "[a-zA-Z0-9_-]{1,32}",
+                // Session IDs can contain colons, underscores, and hyphens
+                session_id in "thread:[a-zA-Z0-9_-]{1,16}:[a-zA-Z0-9_-]{1,16}",
+            ) {
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "test/method",
+                    "sessionId": session_id
+                });
+                let request_bytes = serde_json::to_vec(&request).unwrap();
+
+                let parsed_request = parse_message(request_bytes);
+                let extracted_session_id = parsed_request.routing.session_id.clone();
+                prop_assert_eq!(extracted_session_id.as_deref(), Some(session_id.as_str()));
+
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {}
+                });
+                let mut response_bytes = serde_json::to_vec(&response).unwrap();
+
+                if let Some(sid) = &extracted_session_id {
+                    StdioBusWorker::inject_session_id(&mut response_bytes, sid).unwrap();
+                }
+
+                let final_response: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+                assert_eq!(final_response["sessionId"], serde_json::json!(session_id));
+            }
+        }
+    }
+
+    /// **Validates: Requirements 2.7, 5.5, 8.7**
+    ///
+    /// Property 4: SessionId in Notifications
+    /// Tests that notifications include sessionId for routing.
+    mod property_session_id_in_notifications {
+        use super::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            /// Test that notifications (messages without `id`) can include sessionId for routing.
+            /// Notifications are JSON-RPC messages with a `method` field but no `id` field.
+            #[test]
+            fn notifications_can_include_session_id(
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+            ) {
+                // Create a notification (has method but no id)
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": {},
+                    "sessionId": session_id
+                });
+                let notification_bytes = serde_json::to_vec(&notification).unwrap();
+
+                // Parse the notification
+                let parsed = parse_message(notification_bytes);
+
+                // Verify it's recognized as a notification (has method, no id)
+                prop_assert!(parsed.routing.id.is_none(), "Notification should not have id");
+                prop_assert_eq!(parsed.routing.method.as_deref(), Some(method.as_str()));
+                prop_assert!(!parsed.routing.is_response, "Notification should not be a response");
+
+                // Verify sessionId is extracted for routing
+                prop_assert_eq!(parsed.routing.session_id.as_deref(), Some(session_id.as_str()));
+            }
+
+            /// Test that sessionId in notifications is preserved when sent through the worker.
+            /// This simulates the worker receiving a notification and forwarding it with sessionId.
+            #[test]
+            fn session_id_preserved_when_sending_notification(
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+                param_key in "[a-zA-Z_]{1,16}",
+                param_value in "[a-zA-Z0-9]{1,32}",
+            ) {
+                // Clone param_key before it's moved into json!
+                let param_key_clone = param_key.clone();
+
+                // Create a notification without sessionId (simulating handler output)
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": {
+                        param_key: param_value
+                    }
+                });
+                let mut notification_bytes = serde_json::to_vec(&notification).unwrap();
+
+                // Inject sessionId (simulating worker adding sessionId for routing)
+                let result = StdioBusWorker::inject_session_id(&mut notification_bytes, &session_id);
+                prop_assert!(result.is_ok());
+
+                // Parse the modified notification
+                let parsed = parse_message(notification_bytes);
+
+                // Verify it's still a notification
+                prop_assert!(parsed.routing.id.is_none(), "Should still be a notification");
+                prop_assert_eq!(parsed.routing.method.as_deref(), Some(method.as_str()));
+
+                // Verify sessionId was added for routing
+                prop_assert_eq!(parsed.routing.session_id.as_deref(), Some(session_id.as_str()));
+
+                // Verify params are preserved
+                let parsed_json: serde_json::Value = serde_json::from_slice(&parsed.raw).unwrap();
+                assert_eq!(&parsed_json["params"][&param_key_clone], &serde_json::json!(param_value));
+            }
+
+            /// Test that notifications without sessionId are handled correctly.
+            /// These notifications should parse successfully but have no sessionId for routing.
+            #[test]
+            fn notifications_without_session_id_handled_correctly(
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+            ) {
+                // Create a notification without sessionId
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": {}
+                });
+                let notification_bytes = serde_json::to_vec(&notification).unwrap();
+
+                // Parse the notification
+                let parsed = parse_message(notification_bytes);
+
+                // Verify it's recognized as a notification
+                prop_assert!(parsed.routing.id.is_none(), "Notification should not have id");
+                prop_assert_eq!(parsed.routing.method.as_deref(), Some(method.as_str()));
+                prop_assert!(!parsed.routing.is_response, "Notification should not be a response");
+
+                // Verify sessionId is None (no routing info)
+                prop_assert!(parsed.routing.session_id.is_none(), "Should have no sessionId");
+            }
+
+            /// Test that sessionId is preserved for all session type formats in notifications.
+            #[test]
+            fn session_id_formats_preserved_in_notifications(
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+                session_type in prop_oneof![
+                    "thread:[a-zA-Z0-9_-]{1,32}",
+                    "conn:[0-9]{1,10}",
+                    "mcp:[a-zA-Z0-9_-]{1,32}",
+                ],
+            ) {
+                // Create notification with typed sessionId
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": {"event": "update"}
+                });
+                let mut notification_bytes = serde_json::to_vec(&notification).unwrap();
+
+                // Inject sessionId
+                StdioBusWorker::inject_session_id(&mut notification_bytes, &session_type).unwrap();
+
+                // Parse and verify
+                let parsed = parse_message(notification_bytes);
+                prop_assert!(parsed.routing.id.is_none(), "Should be a notification");
+                prop_assert_eq!(parsed.routing.session_id.as_deref(), Some(session_type.as_str()));
+            }
+
+            /// Test that multiple notifications can have different sessionIds.
+            /// This verifies that each notification maintains its own routing information.
+            #[test]
+            fn different_notifications_have_different_session_ids(
+                notifications in prop::collection::vec(
+                    (
+                        "[a-zA-Z]+/[a-zA-Z]+",  // method
+                        "[a-zA-Z0-9:_-]{1,32}", // session_id
+                    ),
+                    2..10
+                )
+            ) {
+                for (method, session_id) in &notifications {
+                    // Create notification
+                    let notification = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": method,
+                        "params": {}
+                    });
+                    let mut notification_bytes = serde_json::to_vec(&notification).unwrap();
+
+                    // Inject sessionId
+                    StdioBusWorker::inject_session_id(&mut notification_bytes, session_id).unwrap();
+
+                    // Parse and verify this specific notification has correct sessionId
+                    let parsed = parse_message(notification_bytes);
+                    prop_assert!(parsed.routing.id.is_none());
+                    prop_assert_eq!(parsed.routing.method.as_deref(), Some(method.as_str()));
+                    prop_assert_eq!(parsed.routing.session_id.as_deref(), Some(session_id.as_str()));
+                }
+            }
+
+            /// Test that notifications with complex params preserve sessionId correctly.
+            #[test]
+            fn notifications_with_complex_params_preserve_session_id(
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+                nested_key in "[a-zA-Z_]{1,8}",
+                nested_value in "[a-zA-Z0-9]{1,16}",
+            ) {
+                // Clone nested_key before it's moved into json!
+                let nested_key_clone = nested_key.clone();
+
+                // Create notification with nested params
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": {
+                        "data": {
+                            nested_key: nested_value,
+                            "array": [1, 2, 3],
+                            "nested": {
+                                "deep": true
+                            }
+                        }
+                    },
+                    "sessionId": session_id
+                });
+                let notification_bytes = serde_json::to_vec(&notification).unwrap();
+
+                // Parse the notification
+                let parsed = parse_message(notification_bytes);
+
+                // Verify routing fields
+                prop_assert!(parsed.routing.id.is_none());
+                prop_assert_eq!(parsed.routing.method.as_deref(), Some(method.as_str()));
+                prop_assert_eq!(parsed.routing.session_id.as_deref(), Some(session_id.as_str()));
+
+                // Verify complex params are preserved
+                let parsed_json: serde_json::Value = serde_json::from_slice(&parsed.raw).unwrap();
+                assert_eq!(&parsed_json["params"]["data"][&nested_key_clone], &serde_json::json!(nested_value));
+                assert_eq!(&parsed_json["params"]["data"]["array"], &serde_json::json!([1, 2, 3]));
+                assert_eq!(&parsed_json["params"]["data"]["nested"]["deep"], &serde_json::json!(true));
+            }
+
+            /// Test that notification sessionId injection doesn't affect other fields.
+            #[test]
+            fn notification_session_id_injection_preserves_all_fields(
+                method in "[a-zA-Z]+/[a-zA-Z]+",
+                session_id in "[a-zA-Z0-9:_-]{1,64}",
+            ) {
+                // Create notification with various fields
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": {"key": "value"},
+                    "extra": "field"
+                });
+                let mut notification_bytes = serde_json::to_vec(&notification).unwrap();
+
+                // Inject sessionId
+                StdioBusWorker::inject_session_id(&mut notification_bytes, &session_id).unwrap();
+
+                // Verify all original fields are preserved
+                let parsed_json: serde_json::Value = serde_json::from_slice(&notification_bytes).unwrap();
+                assert_eq!(&parsed_json["jsonrpc"], &serde_json::json!("2.0"));
+                assert_eq!(&parsed_json["method"], &serde_json::json!(method));
+                assert_eq!(&parsed_json["params"]["key"], &serde_json::json!("value"));
+                assert_eq!(&parsed_json["extra"], &serde_json::json!("field"));
+                assert_eq!(&parsed_json["sessionId"], &serde_json::json!(session_id));
+
+                // Verify no id field was added
+                prop_assert!(parsed_json.get("id").is_none());
+            }
+        }
+    }
+
     /// Unit tests for edge cases.
     mod unit_tests {
         use super::*;
