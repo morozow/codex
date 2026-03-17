@@ -39,6 +39,7 @@ members = [
     "protocol",
     "rmcp-client",
     "responses-api-proxy",
+    "stdio-bus",
     "stdio-to-uds",
     "otel",
     "tui",
@@ -126,6 +127,7 @@ codex-shell-command = { path = "shell-command" }
 codex-shell-escalation = { path = "shell-escalation" }
 codex-skills = { path = "skills" }
 codex-state = { path = "state" }
+codex-stdio-bus = { path = "stdio-bus" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }
 codex-test-macros = { path = "test-macros" }
 codex-tui = { path = "tui" }
@@ -227,6 +229,7 @@ pathdiff = "0.2"
 portable-pty = "0.9.0"
 predicates = "3"
 pretty_assertions = "1.4.1"
+proptest = "1.6.0"
 pulldown-cmark = "0.10"
 rand = "0.9"
 ratatui = "0.29.0"

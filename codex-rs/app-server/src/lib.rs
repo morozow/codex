@@ -75,10 +75,12 @@ mod server_request_error;
 mod thread_state;
 mod thread_status;
 mod transport;
+mod worker_mode;
 
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
 pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 pub use crate::transport::AppServerTransport;
+pub use crate::worker_mode::run_worker_mode;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
 

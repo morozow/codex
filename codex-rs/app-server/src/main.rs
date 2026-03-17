@@ -1,6 +1,7 @@
 use clap::Parser;
 use codex_app_server::AppServerTransport;
 use codex_app_server::run_main_with_transport;
+use codex_app_server::run_worker_mode;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_core::config_loader::LoaderOverrides;
@@ -13,8 +14,14 @@ const MANAGED_CONFIG_PATH_ENV_VAR: &str = "CODEX_APP_SERVER_MANAGED_CONFIG_PATH"
 
 #[derive(Debug, Parser)]
 struct AppServerArgs {
+    /// Run in stdio_bus worker mode. When set, the app-server reads NDJSON
+    /// messages from stdin and writes responses to stdout, with session
+    /// affinity via sessionId field.
+    #[arg(long)]
+    worker: bool,
+
     /// Transport endpoint URL. Supported values: `stdio://` (default),
-    /// `ws://IP:PORT`.
+    /// `ws://IP:PORT`. Ignored in worker mode.
     #[arg(
         long = "listen",
         value_name = "URL",
@@ -31,16 +38,21 @@ fn main() -> anyhow::Result<()> {
             managed_config_path,
             ..Default::default()
         };
-        let transport = args.listen;
 
-        run_main_with_transport(
-            arg0_paths,
-            CliConfigOverrides::default(),
-            loader_overrides,
-            false,
-            transport,
-        )
-        .await?;
+        if args.worker {
+            // REQ-2.1: Worker mode - run as stdio_bus worker
+            run_worker_mode(arg0_paths, CliConfigOverrides::default(), loader_overrides).await?;
+        } else {
+            // REQ-9.1: Backward compatibility - existing behavior
+            run_main_with_transport(
+                arg0_paths,
+                CliConfigOverrides::default(),
+                loader_overrides,
+                false,
+                args.listen,
+            )
+            .await?;
+        }
         Ok(())
     })
 }
