@@ -1,0 +1,18 @@
+{
+  "pools": [{
+    "id": "codex",
+    "command": "/Users/etc/Projects/Target-Insight-Function/stdio-Bus/sandbox/codex/codex-rs/stdio-bus/scripts/.test-run/codex-app-server",
+    "args": ["--worker"],
+    "instances": 2,
+    "env": {"RUST_LOG": "info"}
+  }],
+  "limits": {
+    "max_input_buffer": 1048576,
+    "max_restarts": 3,
+    "restart_window_sec": 60
+  },
+  "routing": {
+    "session_id_field": "sessionId",
+    "default_pool": "codex"
+  }
+}
