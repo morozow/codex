@@ -4,6 +4,7 @@
 
 ## Table of Contents
 
+- [Worker Mode (stdio_bus Integration)](#worker-mode-stdio_bus-integration)
 - [Protocol](#protocol)
 - [Message Schema](#message-schema)
 - [Core Primitives](#core-primitives)
@@ -16,6 +17,129 @@
 - [Apps](#apps)
 - [Auth endpoints](#auth-endpoints)
 - [Experimental API Opt-in](#experimental-api-opt-in)
+
+## Worker Mode (stdio_bus Integration)
+
+The app-server supports running as a stdio_bus worker for multi-client scenarios. In worker mode, the app-server reads NDJSON messages from stdin and writes responses to stdout, with session affinity via the `sessionId` field.
+
+### Enabling Worker Mode
+
+Use the `--worker` CLI flag:
+
+```bash
+codex app-server --worker
+```
+
+When `--worker` is set:
+- The `--listen` flag is ignored
+- Messages are read from stdin as NDJSON (one JSON object per line)
+- Responses are written to stdout as NDJSON
+- All diagnostic output (logs, traces) goes to stderr only
+- The `sessionId` field in messages is used for session affinity
+
+### Session ID Formats
+
+The stdio_bus integration uses prefixed session IDs to route messages to the correct handler:
+
+| Prefix | Format | Description |
+|--------|--------|-------------|
+| `thread:` | `thread:{threadId}` | Thread-based sessions for Codex conversations |
+| `conn:` | `conn:{connectionId}` | Connection-based sessions (numeric ID) |
+| `mcp:` | `mcp:{serverName}` | MCP server sessions for external MCP servers |
+
+Examples:
+- `thread:thr_abc123` - Routes to thread `thr_abc123`
+- `conn:42` - Routes to connection ID 42
+- `mcp:my-server` - Routes to MCP server named `my-server`
+
+### Message Format
+
+Worker mode uses the same JSON-RPC message format as direct stdio mode, with the addition of the `sessionId` field for routing:
+
+Request:
+```json
+{"method":"thread/start","id":1,"sessionId":"thread:thr_123","params":{...}}
+```
+
+Response:
+```json
+{"id":1,"sessionId":"thread:thr_123","result":{...}}
+```
+
+Notification:
+```json
+{"method":"turn/started","sessionId":"thread:thr_123","params":{...}}
+```
+
+### Configuration Generation
+
+The `codex-stdio-bus` crate provides utilities to generate stdio_bus daemon configuration:
+
+Development configuration (single instance, debug logging):
+```rust
+use codex_stdio_bus::config::StdioBusConfig;
+use std::path::Path;
+
+let config = StdioBusConfig::development(Path::new("~/.codex"));
+config.write_to_file(Path::new("stdio_bus.json"))?;
+```
+
+Production configuration (multiple instances, warn logging):
+```rust
+let config = StdioBusConfig::production("/usr/bin/codex-app-server", 4);
+config.write_to_file(Path::new("stdio_bus.json"))?;
+```
+
+Example generated configuration:
+```json
+{
+  "pools": [
+    {
+      "id": "app-server",
+      "command": "/usr/bin/codex-app-server",
+      "args": ["--worker"],
+      "instances": 4,
+      "env": {
+        "RUST_LOG": "warn"
+      }
+    }
+  ],
+  "limits": {
+    "max_input_buffer": 1048576,
+    "max_output_queue": 4194304,
+    "max_restarts": 5,
+    "restart_window_sec": 60,
+    "drain_timeout_sec": 30,
+    "backpressure_timeout_sec": 60
+  },
+  "routing": {
+    "session_id_field": "sessionId",
+    "default_pool": "app-server"
+  }
+}
+```
+
+Environment variable substitution is supported using `${VAR}` or `${VAR}` syntax:
+```rust
+config.substitute_env_vars();
+```
+
+### Graceful Shutdown
+
+When SIGTERM is received, the worker:
+1. Stops accepting new requests
+2. Drains pending requests within `drain_timeout_sec` (default: 30 seconds)
+3. Cleans up sessions
+4. Exits cleanly
+
+If the worker does not exit within `drain_timeout_sec`, the stdio_bus daemon sends SIGKILL.
+
+### Backward Compatibility
+
+When `--worker` is not set, the app-server behaves exactly as before:
+- Direct stdio transport (`--listen stdio://`) or WebSocket (`--listen ws://IP:PORT`)
+- No session ID handling required
+- Existing client connections work unchanged
 
 ## Protocol
 

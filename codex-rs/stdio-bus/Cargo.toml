@@ -8,6 +8,10 @@ license.workspace = true
 name = "codex_stdio_bus"
 path = "src/lib.rs"
 
+[[bench]]
+name = "performance"
+harness = false
+
 [lints]
 workspace = true
 
@@ -20,6 +24,8 @@ tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "si
 tracing = { workspace = true, features = ["log"] }
 
 [dev-dependencies]
+criterion = { workspace = true }
 pretty_assertions = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
