@@ -624,3 +624,38 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_stdin_on_non_tty_session_succeeds() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+
+    // Spawn `cat` with tty=false. With piped stdin, cat will stay alive
+    // waiting for input instead of exiting immediately on EOF.
+    let open_shell = exec_command_with_tty(
+        &session, &turn, "cat", /*yield_time_ms*/ 500, /*workdir*/ None,
+        /*tty*/ false,
+    )
+    .await?;
+    let process_id = open_shell
+        .process_id
+        .expect("expected process_id for piped-stdin process");
+
+    // write_stdin should now succeed on non-TTY sessions.
+    let out = write_stdin(
+        &session,
+        process_id,
+        "hello from piped stdin\n",
+        /*yield_time_ms*/ 2_500,
+    )
+    .await?;
+
+    assert!(
+        out.truncated_output().contains("hello from piped stdin"),
+        "expected cat to echo piped stdin input, got: {}",
+        out.truncated_output()
+    );
+
+    Ok(())
+}
