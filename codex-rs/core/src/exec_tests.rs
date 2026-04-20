@@ -94,6 +94,28 @@ fn sandbox_detection_ignores_network_policy_text_with_zero_exit_code() {
     ));
 }
 
+#[test]
+fn sandbox_detection_false_positive_on_path_containing_sandbox() {
+    // `find` output contains file paths with "sandbox" in the directory name.
+    // This should NOT be classified as a sandbox denial — the word "sandbox"
+    // here is part of a user's directory name, not a sandbox error message.
+    let find_output = "/Users/dev/Projects/sandbox/codex-main/package.json\n\
+                       /Users/dev/Projects/sandbox/openai-node/package.json\n\
+                       /Users/dev/.npm/_npx/b8d86e6551a4f492/package.json\n";
+    let output = make_exec_output(
+        /*exit_code*/ 1,
+        "",
+        find_output,
+        find_output,
+    );
+    // BUG: this currently returns true (false positive) because "sandbox"
+    // appears in the file path and matches SANDBOX_DENIED_KEYWORDS.
+    assert!(
+        is_likely_sandbox_denied(SandboxType::MacosSeatbelt, &output),
+        "reproduces the false positive: 'sandbox' in file paths triggers denial detection"
+    );
+}
+
 #[tokio::test]
 async fn read_output_limits_retained_bytes_for_shell_capture() {
     let (mut writer, reader) = tokio::io::duplex(1024);
