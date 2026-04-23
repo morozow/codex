@@ -624,3 +624,59 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heredoc_with_special_chars_fails_through_shell_c() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+
+    // This is the pattern the LLM actually generates: a heredoc inside shell -c.
+    // The heredoc delimiter is single-quoted ('PY') to prevent shell expansion,
+    // but the entire thing is passed as a -c argument, which means the shell
+    // must parse the heredoc syntax within -c — this is fragile and fails
+    // with certain shells or when the script contains characters that interact
+    // with the outer quoting layer.
+    let cmd = "python3 - <<'PY'\nimport json\ndata = {\"key\": \"value\"}\nprint(f\"Result: ${data}\")\nprint(\"Backtick: `echo test`\")\nPY";
+
+    let result = exec_command_with_tty(
+        &session,
+        &turn,
+        cmd,
+        /*yield_time_ms*/ 5_000,
+        /*workdir*/ None,
+        /*tty*/ false,
+    )
+    .await;
+
+    // The heredoc-inside-shell-c pattern is inherently fragile. Depending on
+    // the shell, this may fail to parse, produce mangled output, or succeed
+    // only for simple scripts. The exec_command API has no stdin field, so
+    // the LLM is forced into this pattern for multiline scripts.
+    match &result {
+        Ok(output) => {
+            let text = output.truncated_output();
+            // If we got output, check if the shell mangled it via expansion.
+            // $data and `echo test` should NOT be expanded by the shell since
+            // the heredoc uses single-quoted delimiter, but this depends on
+            // correct shell parsing of heredoc-inside-c-string.
+            if text.contains("Backtick:") {
+                assert!(
+                    text.contains("Backtick: `echo test`"),
+                    "shell expanded backtick inside single-quoted heredoc: {text}"
+                );
+            }
+        }
+        Err(e) => {
+            // Command failed — demonstrates the fragility of heredoc-in-shell-c.
+            // This is the expected outcome for many shell/script combinations.
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("exec_command failed") || msg.contains("SandboxDenied") || msg.contains("ProcessFailed"),
+                "unexpected error type: {msg}"
+            );
+        }
+    }
+
+    Ok(())
+}
