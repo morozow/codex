@@ -171,7 +171,6 @@ struct PreparedProcessHandles {
     pause_state: Option<watch::Receiver<bool>>,
     hook_command: String,
     process_id: i32,
-    tty: bool,
 }
 
 fn exec_server_process_id(process_id: i32) -> String {
@@ -421,15 +420,11 @@ impl UnifiedExecProcessManager {
             pause_state,
             hook_command,
             process_id,
-            tty,
             ..
         } = self.prepare_process_handles(process_id).await?;
         let mut status_after_write = None;
 
         if !request.input.is_empty() {
-            if !tty {
-                return Err(UnifiedExecError::StdinClosed);
-            }
             match process.write(request.input.as_bytes()).await {
                 Ok(()) => {
                     // Give the remote process a brief window to react so that we are
@@ -588,7 +583,6 @@ impl UnifiedExecProcessManager {
             pause_state,
             hook_command: entry.hook_command.clone(),
             process_id: entry.process_id,
-            tty: entry.tty,
         })
     }
 
@@ -747,7 +741,7 @@ impl UnifiedExecProcessManager {
             )
             .await
         } else {
-            codex_utils_pty::pipe::spawn_process_no_stdin_with_inherited_fds(
+            codex_utils_pty::pipe::spawn_process_with_inherited_fds(
                 program,
                 args,
                 request.cwd.as_path(),
